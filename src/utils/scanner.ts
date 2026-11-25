@@ -17,6 +17,15 @@ export const SOURCE_LABELS: Record<SourceKind, string> = {
 /** 默认仅保留亚洲机房（与优选地址的机房范围一致） */
 export const ASIAN_COLOS = ['HKG', 'NRT', 'SIN', 'ICN', 'TPE'];
 
+/** 美国常用机房 */
+export const US_COLOS = ['LAX', 'SFO', 'SEA', 'ORD', 'IAD', 'JFK'];
+
+/** 欧洲常用机房 */
+export const EU_COLOS = ['LHR', 'FRA', 'AMS', 'CDG'];
+
+/** 常用机房全集（亚洲 + 美国 + 欧洲）：选项全有，默认只勾亚洲 5 个，不用也不能没有 */
+export const COMMON_COLOS = [...ASIAN_COLOS, ...US_COLOS, ...EU_COLOS];
+
 /** CF 优选端口（BestCF 同款）：固定任选其一，或随机 */
 export const CF_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
 
