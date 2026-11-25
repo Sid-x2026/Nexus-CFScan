@@ -114,6 +114,8 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
     const [total, setTotal] = useState(0);
     const [successCount, setSuccessCount] = useState(0);
     const [failCount, setFailCount] = useState(0);
+    // 达标数（成功数）的 ref：onDone 里算失败数 = 已测数 - 达标数时用，避免 state 闭包取到旧值
+    const qualifiedCountRef = useRef(0);
     const [isStopping, setIsStopping] = useState(false);
     const [uniqueIpCount, setUniqueIpCount] = useState(0);
     const [grossIpCount, setGrossIpCount] = useState(0);
@@ -430,12 +432,16 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
         return { host, ip, port };
     });
 
-    /** 通过本地后端执行测速：下发参数 -> 轮询进度 -> 只汇总达标结果 */
+    /** 通过本地后端执行测速：下发参数 -> 轮询进度 -> 只汇总达标结果
+     *  进度口径：progress = 后端已测完的目标数（p.done），不是达标数；
+     *  成功 = 达标数，失败 = 已测数 - 达标数。否则后端测了几百个都没达标时
+     *  页面一直显示 0%，看着像卡死了。 */
     const runAgentScan = async (
         targets: { host: string; ip: string; port: number }[],
         val: NonNullable<ReturnType<typeof validateInputs>>,
         onProgress: (r: ScanResult) => void,
         onComplete: (rs: ScanResult[]) => void,
+        onDone?: (done: number) => void,
     ) => {
         if (!agentProbe?.online) throw new Error('本地后端未连接');
         const base = agentProbe.baseUrl;
@@ -470,6 +476,8 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                 acc.push(sr);
                 onProgress(sr);
             }
+            // 每次轮询都把后端已测数推给页面，哪怕本轮没有新增达标结果
+            onDone?.(p.done);
 
             if (!p.running) break;
 
@@ -524,18 +532,23 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             setProgress(0);
             setSuccessCount(0);
             setFailCount(0);
+            qualifiedCountRef.current = 0;
             setTotal(targets.length);
             await new Promise(resolve => setTimeout(resolve, 0));
 
             const currentResults: ScanResult[] = [];
+            // onProgress 只在有新增达标结果时触发：只计成功数
             const onProgress = (result: ScanResult) => {
-                setProgress(p => p + 1);
                 currentResults.push(result);
                 if (result.isAvailable) {
-                    setSuccessCount(s => s + 1);
-                } else {
-                    setFailCount(f => f + 1);
+                    qualifiedCountRef.current += 1;
+                    setSuccessCount(qualifiedCountRef.current);
                 }
+            };
+            // onDone 由后端 done 驱动：进度 = 已测数，失败 = 已测数 - 达标数
+            const onDone = (done: number) => {
+                setProgress(done);
+                setFailCount(Math.max(0, done - qualifiedCountRef.current));
             };
 
             const onComplete = (finalResults: ScanResult[]) => {
@@ -559,7 +572,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                 prepared.resolvedMap,
                 ipSource === 'third' || ipSource === 'domain' ? 0 : selectedPort,
             );
-            await runAgentScan(agentTargets, val, onProgress, onComplete);
+            await runAgentScan(agentTargets, val, onProgress, onComplete, onDone);
         } catch (error) {
             console.error('Scan failed:', error);
             setIsScanning(false);
@@ -1036,9 +1049,9 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                             <div className="bg-red-500 h-2.5 transition-all duration-300" style={{ width: `${total > 0 ? (failCount / total) * 100 : 0}%` }}></div>
                         </div>
                         <div className="flex justify-between text-sm mt-1">
-                            <span className="text-green-600">成功: {successCount}</span>
+                            <span className="text-green-600">达标: {successCount}</span>
                             <span className="text-gray-500 dark:text-gray-400">已用: {fmt(elapsedSec)}</span>
-                            <span className="text-red-600">失败: {failCount}</span>
+                            <span className="text-red-600">未达标: {failCount}</span>
                         </div>
                     </div>
                 );
