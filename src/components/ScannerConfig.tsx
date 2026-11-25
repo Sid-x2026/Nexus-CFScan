@@ -24,6 +24,7 @@ import {
     CF_PORTS,
     isQualified,
     parseDirectEntries,
+    SOURCE_LABELS,
     type SourceKind,
 } from '../utils/scanner';
 import {
@@ -44,6 +45,8 @@ interface IpScannerConfigAndControlProps {
 const SCAN_PARAMS_KEY = 'CF_SCAN_PARAMS';
 const DOMAIN_LIST_KEY = 'CF_DOMAIN_LIST';
 const THIRD_DIRECT_KEY = 'THIRD_PARTY_DIRECT_ENTRIES';
+/** 探针域名持久化：localStorage，下次打开自动沿用 */
+const PROBE_HOST_KEY = 'CF_PROBE_HOST';
 /** BestCF 域名列表（cmliu/CF-Pages-BestCF 的 cf_domains.txt），域名源一键导入 */
 const BESTCF_DOMAINS_URLS = [
     'https://raw.githubusercontent.com/cmliu/CF-Pages-BestCF/main/cf_domains.txt',
@@ -74,6 +77,15 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
     const [topN, setTopN] = useState<string>(String(saved.topN));
     const [speedUrl, setSpeedUrl] = useState<string>(saved.speedUrl);
     const [scanMode, setScanMode] = useState<'tcping' | 'httping'>(saved.scanMode);
+    /** 探针域名：节点域名（如 jpagxr.sidns.xyz），后端用它当 SNI 做连通性探针；留空用 speed.cloudflare.com */
+    const [probeHost, setProbeHost] = useState<string>(
+        () => { try { return localStorage.getItem(PROBE_HOST_KEY) || ''; } catch { return ''; } }
+    );
+
+    // 探针域名变动即保存
+    useEffect(() => {
+        try { localStorage.setItem(PROBE_HOST_KEY, probeHost.trim()); } catch { /* 忽略 */ }
+    }, [probeHost]);
     const [portMode, setPortMode] = useState<'fixed' | 'random'>('fixed');
     const [selectedPort, setSelectedPort] = useState(443);
     const [coloFilter, setColoFilter] = useState<string[]>(saved.coloFilter);
@@ -116,6 +128,14 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
     const [failCount, setFailCount] = useState(0);
     // 达标数（成功数）的 ref：onDone 里算失败数 = 已测数 - 达标数时用，避免 state 闭包取到旧值
     const qualifiedCountRef = useRef(0);
+    /** 本次扫描汇总（扫完后持久显示，不随进度浮窗消失） */
+    interface ScanSummary {
+        totalTested: number;
+        totalQualified: number;
+        dedupQualified: number;
+        perSource: { label: string; tested: number; qualified: number }[];
+    }
+    const [lastScanSummary, setLastScanSummary] = useState<ScanSummary | null>(null);
     const [isStopping, setIsStopping] = useState(false);
     const [uniqueIpCount, setUniqueIpCount] = useState(0);
     const [grossIpCount, setGrossIpCount] = useState(0);
@@ -267,7 +287,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
         return resolvedMap;
     };
 
-    const prepareTargets = async (countNum: number): Promise<{ targets: string[]; resolvedMap?: Record<string, string | null> } | null> => {
+    const prepareTargets = async (countNum: number): Promise<{ targets: string[]; resolvedMap?: Record<string, string | null>; sourceMap?: Record<string, string> } | null> => {
         setSourceRows([]);
         setUniqueIpCount(0);
         setGrossIpCount(0);
@@ -289,7 +309,9 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             setIpCount(items.filter(i => !isDomainName(i.host)).length);
             setDomainCount(items.filter(i => isDomainName(i.host)).length);
             const resolvedMap = await resolveDomainItems(items);
-            return { targets, resolvedMap };
+            const sourceMap: Record<string, string> = {};
+            for (const t of targets) sourceMap[t] = '域名源';
+            return { targets, resolvedMap, sourceMap };
         }
 
         // ---------- 第三方源：URL 走后端拉取，直接 IP/域名与本地上传在前端直接解析 ----------
@@ -313,8 +335,8 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             setSourceRows(rows);
             setPrepareTotal(urlSources.length);
 
-            const allIps = new Map<string, { ip: string; port: number }>();
-            for (const item of directItems) allIps.set(`${item.host}:${item.port}`, { ip: item.host, port: item.port });
+            const allIps = new Map<string, { ip: string; port: number; sourceLabel: string }>();
+            for (const item of directItems) allIps.set(`${item.host}:${item.port}`, { ip: item.host, port: item.port, sourceLabel: '手动粘贴' });
             let grossCount = directItems.length;
             let doneCount = 0;
 
@@ -342,8 +364,11 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                 setPrepareDone(doneCount);
 
                 if (stat.status !== 'error') {
+                    // 同一 IP:端口出现在多个源里时，第一次出现的源归属保留（先直接粘贴，后按源顺序）
+                    const label = urlSources[i].replace(/^https?:\/\//, '');
                     for (const item of stat.ips) {
-                        allIps.set(`${item.ip}:${item.port}`, item);
+                        const key = `${item.ip}:${item.port}`;
+                        if (!allIps.has(key)) allIps.set(key, { ip: item.ip, port: item.port, sourceLabel: label });
                     }
                 }
                 grossCount += stat.count;
@@ -370,9 +395,14 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             }
 
             const targets: string[] = [];
-            for (const item of finalIps) targets.push(`${item.ip}:${item.port}`);
+            const sourceMap: Record<string, string> = {};
+            for (const item of finalIps) {
+                const key = `${item.ip}:${item.port}`;
+                targets.push(key);
+                sourceMap[key] = item.sourceLabel;
+            }
             const resolvedMap = await resolveDomainItems(finalIps.map(i => ({ host: i.ip, port: i.port })));
-            return { targets, resolvedMap };
+            return { targets, resolvedMap, sourceMap };
         }
 
         const cidrsToUse = ipSource === 'cf'
@@ -383,37 +413,53 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             showToast('未找到Cloudflare IP段数据，请先点击上方的"同步IP段"按钮进行同步。', 'error');
             return null;
         }
-        return { targets: generateRandomIps(cidrsToUse, countNum) };
+        const targets = generateRandomIps(cidrsToUse, countNum);
+        const sourceLabel = ipSource === 'cf' ? 'CF官方IP段' : 'CM整理IP段';
+        const sourceMap: Record<string, string> = {};
+        for (const t of targets) sourceMap[t] = sourceLabel;
+        return { targets, sourceMap };
     };
 
     // ---------- 本地后端测速 ----------
 
-    /** 后端结果 -> 页面统一的 ScanResult，从而复用原有的结果列表与保存逻辑 */
-    const toScanResult = (r: AgentResult, source: SourceKind): ScanResult => ({
-        ip: r.host,
-        port: r.port,
-        isAvailable: r.ok,
-        latency: r.ok ? r.latency : -1,
-        colo: r.colo || undefined,
-        domain: isDomainName(r.host) || undefined,
-        tcpMs: r.tcpMs >= 0 ? r.tcpMs : undefined,
-        tlsMs: r.tlsMs >= 0 ? r.tlsMs : undefined,
-        error: r.error || undefined,
-        latencies: r.latencies,
-        lossPct: r.lossPct,
-        jitterMs: r.jitterMs,
-        speedMbps: r.speedMbps,
-        source: r.source || source,
-    });
+    /** 后端结果 -> 页面统一的 ScanResult，从而复用原有的结果列表与保存逻辑。
+     *  后端回传的 source 可能是 SourceKind，也可能是每条源的标签；
+     *  是标签时拆到 sourceLabel，source 仍保留本次扫描的 SourceKind，
+     *  这样结果列表按来源筛选的逻辑不受影响。 */
+    const toScanResult = (r: AgentResult, source: SourceKind): ScanResult => {
+        const isKind = (v: string | undefined): v is SourceKind =>
+            v === 'cf' || v === 'cm' || v === 'domain' || v === 'third';
+        return {
+            ip: r.host,
+            port: r.port,
+            isAvailable: r.ok,
+            latency: r.ok ? r.latency : -1,
+            colo: r.colo || undefined,
+            domain: isDomainName(r.host) || undefined,
+            tcpMs: r.tcpMs >= 0 ? r.tcpMs : undefined,
+            tlsMs: r.tlsMs >= 0 ? r.tlsMs : undefined,
+            error: r.error || undefined,
+            latencies: r.latencies,
+            lossPct: r.lossPct,
+            jitterMs: r.jitterMs,
+            speedMbps: r.speedMbps,
+            source: isKind(r.source) ? r.source : source,
+            sourceLabel: isKind(r.source) ? undefined : r.source,
+            resolvedIp: r.ip,
+        };
+    };
 
     /**
-     * 把页面已有的靶标字符串解析成后端需要的 {host, ip, port}。
+     * 把页面已有的靶标字符串解析成后端需要的 {host, ip, port, source}。
      * 域名源用 DoH 已解析出的 IP 去连接，但 host 保留域名。
+     * source 为 prepareTargets 记录的每条源标签（sourceMap），后端原样回传，
+     * 用于扫完后的按源汇总；没有记录时不传，后端用 payload 的 source 兜底。
      */
     const buildAgentTargets = (
         rawTargets: string[],
         resolvedMap?: Record<string, string | null>,
-        defaultPort = 443
+        defaultPort = 443,
+        sourceMap?: Record<string, string>,
     ) => rawTargets.map((raw) => {
         let host = raw;
         let port = defaultPort;
@@ -429,7 +475,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
         }
         if (port === 0) port = 443;
         const ip = (resolvedMap && resolvedMap[raw]) || host;
-        return { host, ip, port };
+        return { host, ip, port, source: sourceMap?.[raw] };
     });
 
     /** 通过本地后端执行测速：下发参数 -> 轮询进度 -> 只汇总达标结果
@@ -437,11 +483,12 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
      *  成功 = 达标数，失败 = 已测数 - 达标数。否则后端测了几百个都没达标时
      *  页面一直显示 0%，看着像卡死了。 */
     const runAgentScan = async (
-        targets: { host: string; ip: string; port: number }[],
+        targets: { host: string; ip: string; port: number; source?: string }[],
         val: NonNullable<ReturnType<typeof validateInputs>>,
         onProgress: (r: ScanResult) => void,
         onComplete: (rs: ScanResult[]) => void,
         onDone?: (done: number) => void,
+        onSummary?: (allQualified: ScanResult[]) => void,
     ) => {
         if (!agentProbe?.online) throw new Error('本地后端未连接');
         const base = agentProbe.baseUrl;
@@ -452,6 +499,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             timeoutMs: val.timeoutNum,
             latencyLimit: val.latencyLimitNum,
             source: ipSource,
+            probeHost: probeHost.trim() || undefined,
             rounds: val.roundsNum,
             lossLimit: val.lossLimitNum,
             jitterStable: val.jitterStableNum,
@@ -491,9 +539,13 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             await new Promise((r) => setTimeout(r, 400));
         }
 
-        // 后端只回传达标结果，前端按同一口径再过滤一次，按延迟取前 topN 条
-        const qualified = acc
-            .filter((r) => isQualified(r, { latencyLimit: val.latencyLimitNum, lossLimit: val.lossLimitNum }))
+        // 后端只回传达标结果，前端按同一口径再过滤一次，按延迟取前 topN 条。
+        // 汇总用不过滤、不截取的全部达标结果（onSummary），否则 topN 会把
+        // 每源可用数算少；onComplete 仍只拿截取后的前 topN 条去展示。
+        const qualifiedAll = acc
+            .filter((r) => isQualified(r, { latencyLimit: val.latencyLimitNum, lossLimit: val.lossLimitNum }));
+        onSummary?.(qualifiedAll);
+        const qualified = [...qualifiedAll]
             .sort((a, b) => a.latency - b.latency)
             .slice(0, val.topNNum);
         onComplete(qualified);
@@ -533,6 +585,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             setSuccessCount(0);
             setFailCount(0);
             qualifiedCountRef.current = 0;
+            setLastScanSummary(null);
             setTotal(targets.length);
             await new Promise(resolve => setTimeout(resolve, 0));
 
@@ -571,8 +624,43 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                 targets,
                 prepared.resolvedMap,
                 ipSource === 'third' || ipSource === 'domain' ? 0 : selectedPort,
+                prepared.sourceMap,
             );
-            await runAgentScan(agentTargets, val, onProgress, onComplete, onDone);
+            // 按源汇总：tested 按下发目标的 source 标签统计（按首次出现顺序排），
+            // qualified 按全部达标结果（不过滤、不截取）的 sourceLabel 统计；
+            // 同一 IP:端口出现在多个源时，每个源的可用数都算，去重后总数只算一次。
+            const onSummary = (allQualified: ScanResult[]) => {
+                const testedByLabel = new Map<string, number>();
+                const order: string[] = [];
+                for (const t of agentTargets) {
+                    const label = t.source || '未知来源';
+                    if (!testedByLabel.has(label)) { testedByLabel.set(label, 0); order.push(label); }
+                    testedByLabel.set(label, testedByLabel.get(label)! + 1);
+                }
+                const qualifiedByLabel = new Map<string, number>();
+                const seen = new Set<string>();
+                let dedup = 0;
+                for (const r of allQualified) {
+                    const label = r.sourceLabel || (r.source ? SOURCE_LABELS[r.source] : undefined) || '未知来源';
+                    qualifiedByLabel.set(label, (qualifiedByLabel.get(label) ?? 0) + 1);
+                    const key = `${r.ip}:${r.port}`;
+                    if (!seen.has(key)) { seen.add(key); dedup++; }
+                }
+                for (const label of qualifiedByLabel.keys()) {
+                    if (!testedByLabel.has(label)) { testedByLabel.set(label, 0); order.push(label); }
+                }
+                setLastScanSummary({
+                    totalTested: agentTargets.length,
+                    totalQualified: allQualified.length,
+                    dedupQualified: dedup,
+                    perSource: order.map(label => ({
+                        label,
+                        tested: testedByLabel.get(label) ?? 0,
+                        qualified: qualifiedByLabel.get(label) ?? 0,
+                    })),
+                });
+            };
+            await runAgentScan(agentTargets, val, onProgress, onComplete, onDone, onSummary);
         } catch (error) {
             console.error('Scan failed:', error);
             setIsScanning(false);
@@ -822,6 +910,19 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                     </div>
                     <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">TCPing 为 TCP 握手延迟，HTTPing 为 TTFB</p>
                 </div>
+                <div>
+                    <label htmlFor="probe-host" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">探针域名:</label>
+                    <input
+                        id="probe-host"
+                        type="text"
+                        value={probeHost}
+                        onChange={(e) => setProbeHost(e.target.value)}
+                        placeholder="如 jpagxr.sidns.xyz，留空则用 speed.cloudflare.com"
+                        className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
+                        disabled={isScanning || isPreparing}
+                    />
+                    <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">填节点域名，后端用它当 SNI 探针，通不了的优选 IP 直接筛掉；留空则用 speed.cloudflare.com</p>
+                </div>
             </div>
 
             {/* 机房筛选：常用机房全有（亚洲 + 美国 + 欧洲），默认只勾亚洲 5 个 */}
@@ -1010,6 +1111,24 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                                 </span>
                             </div>
                         ))}
+                    </div>
+                </div>
+            )}
+
+            {/* 本次扫描汇总：扫完后持久显示，不随进度浮窗消失 */}
+            {lastScanSummary && (
+                <div className="mb-4 rounded-lg border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 p-4">
+                    <h3 className="text-sm font-bold text-gray-700 dark:text-gray-200 mb-2">本次扫描汇总</h3>
+                    <div className="space-y-1 text-sm text-gray-600 dark:text-gray-300">
+                        {lastScanSummary.perSource.map((row) => (
+                            <div key={row.label} className="flex justify-between gap-2">
+                                <span className="font-mono truncate" title={row.label}>{row.label}</span>
+                                <span className="shrink-0">测 {row.tested} 个，可用 <strong className="text-green-600">{row.qualified}</strong> 个</span>
+                            </div>
+                        ))}
+                    </div>
+                    <div className="mt-2 pt-2 border-t border-gray-200 dark:border-gray-600 text-sm text-gray-700 dark:text-gray-200">
+                        去重后可用：<strong className="text-green-600">{lastScanSummary.dedupQualified}</strong> 个 / 共测 {lastScanSummary.totalTested} 个
                     </div>
                 </div>
             )}

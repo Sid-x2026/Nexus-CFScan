@@ -1,9 +1,16 @@
 import { useState, useEffect, useRef } from 'react';
 import { saveResults, getScenes } from '../api';
 import { ScanResult, getLatencyColor, SOURCE_LABELS, type SourceKind } from '../utils/scanner';
+import {
+    probeLocalAgent, probeSingle, speedSingle, DEFAULT_AGENT_PORT, AGENT_BUSY_ERROR,
+    type SingleProbeResult, type SingleSpeedResult,
+} from '../utils/localAgent';
 import { useToast } from './Toast';
 import { ListFilter, Save } from 'lucide-react';
 import { RegionDisplay } from './RegionDisplay';
+
+/** 与 ScannerConfig 的探针域名输入框共用同一个 localStorage 键 */
+const PROBE_HOST_KEY = 'CF_PROBE_HOST';
 
 interface IpScannerResultsAndSaveProps {
     scanResults: ScanResult[];
@@ -29,6 +36,82 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
     const [selectedPorts, setSelectedPorts] = useState<Set<string>>(new Set());
     const [selectedSources, setSelectedSources] = useState<Set<SourceKind>>(new Set());
     const filterInitialized = useRef(false);
+
+    // ---------- 单条按需测试（每行“探针”“测速”按钮，不触发整轮扫描） ----------
+    interface RowTest {
+        probe?: SingleProbeResult;
+        speed?: SingleSpeedResult;
+        testing?: 'probe' | 'speed';
+    }
+    const [rowTests, setRowTests] = useState<Record<string, RowTest>>({});
+    // 本地后端地址：首次测试时用 probeLocalAgent 自行探测并记住，
+    // 与 ScannerConfig 共用同一后端（默认 13335，LOCAL_AGENT_PORT 可改）。
+    const [agentBase, setAgentBase] = useState<string | null>(null);
+    const { showToast } = useToast();
+
+    const getAgentBase = async (): Promise<string | null> => {
+        if (agentBase) return agentBase;
+        const port = Number(localStorage.getItem('LOCAL_AGENT_PORT') || '') || DEFAULT_AGENT_PORT;
+        const r = await probeLocalAgent(port);
+        if (!r.online) {
+            showToast('本地后端未连接，请先启动本地后端', 'error');
+            return null;
+        }
+        setAgentBase(r.baseUrl);
+        return r.baseUrl;
+    };
+
+    /** 整轮扫描进行中时不测：先查 /status，收到后端 409 也一样处理 */
+    const checkBusy = async (base: string): Promise<boolean> => {
+        try {
+            const res = await fetch(`${base}/status`);
+            const s = await res.json() as { running?: boolean };
+            if (s?.running) {
+                showToast('请等扫描结束再测', 'warning');
+                return true;
+            }
+        } catch {
+            // 查不到就交给后端 409 判断
+        }
+        return false;
+    };
+
+    const readProbeHost = (): string => {
+        try { return (localStorage.getItem(PROBE_HOST_KEY) || '').trim(); } catch { return ''; }
+    };
+
+    const runRowTest = async (row: ScanResult, kind: 'probe' | 'speed') => {
+        const key = `${row.ip}:${row.port}`;
+        if (rowTests[key]?.testing) return;
+        const base = await getAgentBase();
+        if (!base) return;
+        if (await checkBusy(base)) return;
+        setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: kind } }));
+        const req = {
+            host: row.ip,
+            ip: row.resolvedIp || row.ip,
+            port: row.port,
+            probeHost: readProbeHost(),
+            speedUrl: 'auto',
+            timeoutMs: 5000,
+        };
+        try {
+            if (kind === 'probe') {
+                const res = await probeSingle(base, req);
+                setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: undefined, probe: res } }));
+            } else {
+                const res = await speedSingle(base, req);
+                setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: undefined, speed: res } }));
+            }
+        } catch (e) {
+            if (e instanceof Error && e.message === AGENT_BUSY_ERROR) {
+                showToast('请等扫描结束再测', 'warning');
+            } else {
+                showToast(`测试失败: ${e instanceof Error ? e.message : '未知错误'}`, 'error');
+            }
+            setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: undefined } }));
+        }
+    };
 
     const uniqueRegions: string[] = Array.from(new Set(scanResults.map(r => r.colo))).filter((r): r is string => !!r).sort();
     const uniquePorts: number[] = Array.from(new Set(scanResults.map(r => r.port))).sort((a, b) => a - b);
@@ -118,8 +201,6 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
             return regionCountsForLimit[colo] <= effectiveIpsPerRegion;
         });
     }
-
-    const { showToast } = useToast();
 
     const handleSave = async () => {
         if (filteredResults.length === 0) {
@@ -369,10 +450,11 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">丢包</th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">抖动</th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">地区</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">测试</th>
                             </tr>
                         </thead>
                         <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                            {limitedResults.map(({ ip, port, latency, colo, domain, latencies, lossPct, jitterMs, source }) => (
+                            {limitedResults.map(({ ip, port, latency, colo, domain, latencies, lossPct, jitterMs, source, resolvedIp, sourceLabel }) => (
                                 <tr key={`${ip}:${port}`} className="hover:bg-gray-100 dark:hover:bg-gray-700">
                                     <td className="px-6 py-4 whitespace-nowrap text-sm font-mono text-gray-900 dark:text-white">
                                         {ip}
@@ -385,6 +467,49 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{lossPct !== undefined ? `${lossPct}%` : '-'}</td>
                                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{jitterMs !== undefined ? `${jitterMs}ms` : '-'}</td>
                                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{colo ? <RegionDisplay colo={colo} flagSize="sm" /> : '-'}</td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                        {(() => {
+                                            const key = `${ip}:${port}`;
+                                            const t = rowTests[key];
+                                            const busy = t?.testing !== undefined;
+                                            return (
+                                                <div className="flex flex-col gap-1">
+                                                    <div className="flex gap-1">
+                                                        <button
+                                                            type="button"
+                                                            disabled={busy}
+                                                            onClick={() => void runRowTest({ ip, port, latency, colo, domain, latencies, lossPct, jitterMs, source, resolvedIp, sourceLabel, isAvailable: true } as ScanResult, 'probe')}
+                                                            className="px-2 py-0.5 text-xs font-medium rounded-full bg-teal-100 text-teal-700 hover:bg-teal-200 dark:bg-teal-900/40 dark:text-teal-300 dark:hover:bg-teal-800/60 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                                        >
+                                                            {t?.testing === 'probe' ? '探针中…' : '探针'}
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            disabled={busy}
+                                                            onClick={() => void runRowTest({ ip, port, latency, colo, domain, latencies, lossPct, jitterMs, source, resolvedIp, sourceLabel, isAvailable: true } as ScanResult, 'speed')}
+                                                            className="px-2 py-0.5 text-xs font-medium rounded-full bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/40 dark:text-blue-300 dark:hover:bg-blue-800/60 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                                        >
+                                                            {t?.testing === 'speed' ? '测速中…' : '测速'}
+                                                        </button>
+                                                    </div>
+                                                    {t?.probe && (
+                                                        <span className={t.probe.ok ? 'text-green-600' : 'text-red-600'}>
+                                                            {t.probe.ok
+                                                                ? `通${t.probe.colo ? ` ${t.probe.colo}` : ''}${t.probe.latencyMs !== undefined ? ` ${t.probe.latencyMs}ms` : ''}`
+                                                                : '不通'}
+                                                        </span>
+                                                    )}
+                                                    {t?.speed && (
+                                                        <span className={t.speed.ok ? 'text-blue-600' : 'text-red-600'}>
+                                                            {t.speed.ok && t.speed.speedMbps !== undefined
+                                                                ? `${t.speed.speedMbps.toFixed(1)} MB/s`
+                                                                : '测速失败'}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            );
+                                        })()}
+                                    </td>
                                 </tr>
                             ))}
                         </tbody>

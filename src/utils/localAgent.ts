@@ -58,8 +58,13 @@ export interface AgentResult {
     jitterMs?: number;
     /** 入选后测速速率（MB/s），未测速时为空 */
     speedMbps?: number;
-    /** 结果来源：cf / cm / domain / third */
-    source?: SourceKind;
+    /** 结果来源：后端原样回传每条目标的 source。
+     *  可能是 SourceKind（'cf' | 'cm' | 'domain' | 'third'），也可能是
+     *  每条源的标签（如 'CF官方IP段'、'bestcf.pages.dev/domain/all.txt'）；
+     *  前端 toScanResult 会把标签拆到 sourceLabel，source 仍保留 SourceKind。 */
+    source?: string;
+    /** 每条源的标签（与 source 不同时才有，见上） */
+    sourceLabel?: string;
 }
 
 export interface AgentProgress {
@@ -82,13 +87,16 @@ export interface AgentProgress {
  * topN 为本次新增的达标判定参数，后端按此判定，只回传达标结果。
  */
 export interface AgentScanPayload {
-    targets: { host: string; ip: string; port: number }[];
+    targets: { host: string; ip: string; port: number; source?: string }[];
     threads: number;
     timeoutMs: number;
     latencyLimit: number;
     sni?: string;
     httpHost?: string;
     source?: SourceKind;
+    /** 探针域名（节点域名，如 jpagxr.sidns.xyz）：后端用它当 SNI 做连通性
+     *  探针；留空则用 speed.cloudflare.com。由 ScannerConfig 的探针域名输入框提供。 */
+    probeHost?: string;
     /** 测速轮次，默认 3 */
     rounds?: number;
     /** 丢包上限（%），3 次均须达标，默认 10 */
@@ -200,4 +208,56 @@ export async function stopAgentScan(baseUrl: string): Promise<void> {
     } catch {
         // 停止失败不影响前端收尾
     }
+}
+
+// ==================================================================
+// 单条按需测试（结果表每行的“探针”“测速”按钮，不触发整轮扫描）
+// ==================================================================
+
+export interface SingleProbeResult {
+    ok: boolean;
+    colo?: string;
+    loc?: string;
+    latencyMs?: number;
+    error?: string;
+}
+
+export interface SingleSpeedResult {
+    ok: boolean;
+    speedMbps?: number;
+    bytes?: number;
+    elapsedMs?: number;
+    error?: string;
+}
+
+export interface SingleTestReq {
+    host: string;
+    ip: string;
+    port: number;
+    probeHost?: string;
+    speedUrl?: string;
+    timeoutMs?: number;
+}
+
+/** 后端 409（整轮扫描进行中）时抛出的错误标识，调用方据此提示“请等扫描结束再测” */
+export const AGENT_BUSY_ERROR = 'AGENT_BUSY';
+
+async function singleTest<T>(baseUrl: string, path: '/probe' | '/speed', req: SingleTestReq, timeoutMs: number): Promise<T> {
+    const res = await agentFetch(baseUrl, path, {
+        method: 'POST',
+        body: JSON.stringify(req),
+    }, timeoutMs);
+    if (res.status === 409) throw new Error(AGENT_BUSY_ERROR);
+    if (!res.ok) throw new Error(`请求失败（HTTP ${res.status}）`);
+    return (await res.json()) as T;
+}
+
+/** 单条连通性探针：用 probeHost 当 SNI 连一次该 IP:端口，读 /cdn-cgi/trace */
+export async function probeSingle(baseUrl: string, req: SingleTestReq): Promise<SingleProbeResult> {
+    return singleTest<SingleProbeResult>(baseUrl, '/probe', req, 12000);
+}
+
+/** 单条下载测速：经该 IP:端口下载测速文件，最多约 10 MB 或 8 秒 */
+export async function speedSingle(baseUrl: string, req: SingleTestReq): Promise<SingleSpeedResult> {
+    return singleTest<SingleSpeedResult>(baseUrl, '/speed', req, 15000);
 }

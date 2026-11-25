@@ -54,6 +54,9 @@ type Target struct {
 	Host string `json:"host"`
 	IP   string `json:"ip"`
 	Port int    `json:"port"`
+	// 每条源的标签（如 "CF官方IP段"、"bestcf.pages.dev/domain/all.txt"），
+	// 前端 prepareTargets 记录，后端原样回传到 AgentResult.Source。
+	Source string `json:"source,omitempty"`
 }
 
 type ScanPayload struct {
@@ -64,6 +67,9 @@ type ScanPayload struct {
 	SNI          string   `json:"sni"`
 	HTTPHost     string   `json:"httpHost"`
 	Source       string   `json:"source"`
+	// 探针域名（节点域名，如 jpagxr.sidns.xyz）：连通性探针用它当 SNI；
+	// 留空则用 speed.cloudflare.com。
+	ProbeHost    string   `json:"probeHost,omitempty"`
 	Rounds       int      `json:"rounds"`
 	LossLimit    float64  `json:"lossLimit"`
 	JitterStable int      `json:"jitterStable"`
@@ -216,6 +222,7 @@ func httpingRound(ip string, port int, host string, timeout time.Duration) (ttfb
 	}
 	dialer := &net.Dialer{Timeout: timeout}
 	transport := &http.Transport{
+		Proxy: nil, // direct dial only: never use HTTP_PROXY/HTTPS_PROXY
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			// Always dial the raw IP, never the hostname.
 			return dialer.DialContext(ctx, network, net.JoinHostPort(ip, strconv.Itoa(port)))
@@ -249,26 +256,56 @@ func httpingRound(ip string, port int, host string, timeout time.Duration) (ttfb
 	return ms(firstByte.Sub(start)), tcpMs, tlsMs, nil
 }
 
-// detectColo dials ip:port over TLS (SNI speed.cloudflare.com) and reads
-// /cdn-cgi/trace. Returns (colo, loc); on any failure both are "".
-func detectColo(ip string, port int, timeout time.Duration) (string, string) {
-	sni := "speed.cloudflare.com"
+// probeConnectivity dials ip:port and reads /cdn-cgi/trace, which doubles
+// as the connectivity probe and the colo detector.
+//   - TLS ports (443/2053/2083/2087/2096/8443): TLS handshake with
+//     SNI = probeHost (a node domain, e.g. jpagxr.sidns.xyz) when it is a
+//     non-empty domain, else speed.cloudflare.com.
+//   - Other ports: plain HTTP, Host = the same SNI.
+// Returns (colo, loc, ok); ok is false on dial / TLS / HTTP error.
+// A successful trace always parses colo=/loc= when the edge returns them.
+func probeConnectivity(ip string, port int, timeout time.Duration, probeHost string) (string, string, bool) {
+	sni := strings.TrimSpace(probeHost)
+	if sni == "" || !isDomain(sni) {
+		sni = "speed.cloudflare.com"
+	}
+	useTLS := tlsPorts[port]
 	dialer := &net.Dialer{Timeout: timeout}
 	transport := &http.Transport{
+		Proxy: nil, // direct dial only: never use HTTP_PROXY/HTTPS_PROXY
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Always dial the raw IP, never the hostname.
 			return dialer.DialContext(ctx, network, net.JoinHostPort(ip, strconv.Itoa(port)))
 		},
-		TLSClientConfig: &tls.Config{ServerName: sni, InsecureSkipVerify: true}, //nolint:gosec
+	}
+	if useTLS {
+		transport.TLSClientConfig = &tls.Config{ServerName: sni, InsecureSkipVerify: true} //nolint:gosec // IP dial: cert cannot match; SNI is what matters
 	}
 	client := &http.Client{Transport: transport, Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	resp, err := client.Get("https://" + sni + "/cdn-cgi/trace")
+	scheme := "http"
+	if useTLS {
+		scheme = "https"
+	}
+	req, err := http.NewRequest(http.MethodGet, scheme+"://"+sni+"/cdn-cgi/trace", nil)
 	if err != nil {
-		return "", ""
+		return "", "", false
+	}
+	req.Host = sni
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", false
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
-		return "", ""
+		return "", "", false
+	}
+	// The endpoint must actually serve a Cloudflare trace: HTTP 2xx and a
+	// colo= line. A plain HTTP server answering 404 (or any non-CF body)
+	// does NOT count as a successful probe — otherwise any open port
+	// would pass the connectivity check.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", "", false
 	}
 	var colo, loc string
 	for _, line := range strings.Split(string(body), "\n") {
@@ -283,7 +320,10 @@ func detectColo(ip string, port int, timeout time.Duration) (string, string) {
 			loc = kv[1]
 		}
 	}
-	return colo, loc
+	if colo == "" {
+		return "", "", false
+	}
+	return colo, loc, true
 }
 
 // measureTarget runs `rounds` measurements for one target and returns a
@@ -361,12 +401,23 @@ func measureTarget(ctx context.Context, t Target, p ScanPayload) *AgentResult {
 		Latencies: latencies,
 		LossPct:   lossPct,
 		JitterMs:  jitter,
-		Source:    p.Source,
+		// 每条目标自带的源标签优先回传，没有才用 payload 级的 source。
+		Source: func() string {
+			if t.Source != "" {
+				return t.Source
+			}
+			return p.Source
+		}(),
 	}
-	// Colo detection only for qualified candidates. A failed detection
-	// does NOT drop the result; a detected colo outside the filter does.
-	colo, loc := detectColo(t.IP, t.Port, 5*time.Second)
+	// 连通性探针 + 机房识别，只对达标候选做一次。
+	// probeHost 填了节点域名时，探针失败 = 这个优选 IP 连不上该节点，
+	// 直接丢掉；留空时沿用旧行为，探针失败不丢结果（colo/loc 留空）。
+	probeHost := strings.TrimSpace(p.ProbeHost)
+	colo, loc, probeOK := probeConnectivity(t.IP, t.Port, 5*time.Second, probeHost)
 	res.Colo, res.Loc = colo, loc
+	if probeHost != "" && isDomain(probeHost) && !probeOK {
+		return nil
+	}
 	if colo != "" && len(p.ColoFilter) > 0 {
 		allowed := false
 		for _, c := range p.ColoFilter {
@@ -427,6 +478,177 @@ sendLoop:
 	}
 	close(jobs)
 	wg.Wait()
+}
+
+// ---------------------------------------------------------------------------
+// Per-row on-demand tests (POST /probe, POST /speed). These never touch the
+// running scan; callers must check /status first, and the handlers also
+// refuse with 409 while a scan is running.
+// ---------------------------------------------------------------------------
+
+type probeReq struct {
+	Host      string `json:"host"`
+	IP        string `json:"ip"`
+	Port      int    `json:"port"`
+	ProbeHost string `json:"probeHost"`
+	TimeoutMs int    `json:"timeoutMs"`
+}
+
+type probeResp struct {
+	OK        bool   `json:"ok"`
+	Colo      string `json:"colo,omitempty"`
+	Loc       string `json:"loc,omitempty"`
+	LatencyMs int    `json:"latencyMs"`
+	Error     string `json:"error,omitempty"`
+}
+
+type speedReq struct {
+	Host      string `json:"host"`
+	IP        string `json:"ip"`
+	Port      int    `json:"port"`
+	ProbeHost string `json:"probeHost"`
+	SpeedURL  string `json:"speedUrl"`
+	TimeoutMs int    `json:"timeoutMs"`
+}
+
+type speedResp struct {
+	OK        bool    `json:"ok"`
+	SpeedMbps float64 `json:"speedMbps"`
+	Bytes     int64   `json:"bytes"`
+	ElapsedMs int     `json:"elapsedMs"`
+	Error     string  `json:"error,omitempty"`
+}
+
+// scanRunning reports whether a scan task is currently running.
+func scanRunning() bool {
+	t := snapshotTask()
+	return t != nil && t.running
+}
+
+// probeSNI returns the SNI/Host to use: the probe domain when it is a
+// non-empty domain, else speed.cloudflare.com.
+func probeSNI(probeHost string) string {
+	sni := strings.TrimSpace(probeHost)
+	if sni == "" || !isDomain(sni) {
+		return "speed.cloudflare.com"
+	}
+	return sni
+}
+
+// handleProbe: POST /probe — single IP/port connectivity probe.
+func handleProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "method not allowed"})
+		return
+	}
+	if scanRunning() {
+		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": "scan running"})
+		return
+	}
+	var req probeReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid JSON: " + err.Error()})
+		return
+	}
+	if req.IP == "" || req.Port <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "ip and port are required"})
+		return
+	}
+	timeout := time.Duration(req.TimeoutMs) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	start := time.Now()
+	colo, loc, ok := probeConnectivity(req.IP, req.Port, timeout, req.ProbeHost)
+	resp := probeResp{OK: ok, Colo: colo, Loc: loc, LatencyMs: ms(time.Since(start))}
+	if !ok {
+		resp.Error = "探针连接失败（TLS 握手或 HTTP 请求失败）"
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleSpeed: POST /speed — single IP/port download speed test.
+// Downloads via ip:port with SNI = probeHost (or speed.cloudflare.com),
+// capped at ~10 MB or ~8 s, whichever comes first.
+func handleSpeed(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "method not allowed"})
+		return
+	}
+	if scanRunning() {
+		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": "scan running"})
+		return
+	}
+	var req speedReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid JSON: " + err.Error()})
+		return
+	}
+	if req.IP == "" || req.Port <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "ip and port are required"})
+		return
+	}
+	speedURL := strings.TrimSpace(req.SpeedURL)
+	if speedURL == "" || speedURL == "auto" {
+		speedURL = "https://speed.cloudflare.com/__down?bytes=10000000"
+	}
+	// Total budget: ~8 s max (or the caller's timeout if smaller).
+	total := 8 * time.Second
+	if req.TimeoutMs > 0 && time.Duration(req.TimeoutMs)*time.Millisecond < total {
+		total = time.Duration(req.TimeoutMs) * time.Millisecond
+	}
+	dialTimeout := 5 * time.Second
+	if req.TimeoutMs > 0 && time.Duration(req.TimeoutMs)*time.Millisecond < dialTimeout {
+		dialTimeout = time.Duration(req.TimeoutMs) * time.Millisecond
+	}
+	sni := probeSNI(req.ProbeHost)
+	useTLS := strings.HasPrefix(strings.ToLower(speedURL), "https://")
+	dialer := &net.Dialer{Timeout: dialTimeout}
+	transport := &http.Transport{
+		Proxy: nil, // direct dial only: never use HTTP_PROXY/HTTPS_PROXY
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, net.JoinHostPort(req.IP, strconv.Itoa(req.Port)))
+		},
+	}
+	if useTLS {
+		transport.TLSClientConfig = &tls.Config{ServerName: sni, InsecureSkipVerify: true} //nolint:gosec // IP dial: cert cannot match; SNI is what matters
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), total)
+	defer cancel()
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, speedURL, nil)
+	if err != nil {
+		writeJSON(w, http.StatusOK, speedResp{OK: false, Error: "测速地址无效：" + err.Error()})
+		return
+	}
+	httpReq.Host = sni
+	start := time.Now()
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		writeJSON(w, http.StatusOK, speedResp{OK: false, ElapsedMs: ms(time.Since(start)), Error: "下载失败：" + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		writeJSON(w, http.StatusOK, speedResp{OK: false, ElapsedMs: ms(time.Since(start)), Error: fmt.Sprintf("HTTP %d", resp.StatusCode)})
+		return
+	}
+	// Cap at 10 MB; the context deadline caps the time at ~8 s.
+	n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, 10*1024*1024))
+	elapsed := time.Since(start)
+	elapsedMs := ms(elapsed)
+	if n <= 0 {
+		writeJSON(w, http.StatusOK, speedResp{OK: false, ElapsedMs: elapsedMs, Error: "未下载到数据"})
+		return
+	}
+	secs := elapsed.Seconds()
+	if secs <= 0 {
+		secs = 0.001
+	}
+	mbps := float64(n) * 8 / secs / 1e6
+	mbps = float64(int(mbps*100)) / 100
+	writeJSON(w, http.StatusOK, speedResp{OK: true, SpeedMbps: mbps, Bytes: n, ElapsedMs: elapsedMs})
 }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +739,7 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	if p.TopN <= 0 {
 		p.TopN = 20
 	}
+	p.ProbeHost = strings.TrimSpace(p.ProbeHost)
 	// NOTE: portMode is accepted but not acted on — the frontend already
 	// picks the port per target. speedUrl is accepted but ignored in v1
 	// (no download speed test).
@@ -617,11 +840,13 @@ func main() {
 	mux.HandleFunc("/scan", cors(handleScan))
 	mux.HandleFunc("/progress", cors(handleProgress))
 	mux.HandleFunc("/stop", cors(handleStop))
+	mux.HandleFunc("/probe", cors(handleProbe))
+	mux.HandleFunc("/speed", cors(handleSpeed))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "not found"})
 	})
 	log.Printf("nexus-cfscan-agent %s listening on http://127.0.0.1:%d", version, port)
-	log.Printf("endpoints: GET /status, POST /scan, GET /progress?since=N, POST /stop")
+	log.Printf("endpoints: GET /status, POST /scan, GET /progress?since=N, POST /stop, POST /probe, POST /speed")
 	if err := http.Serve(ln, mux); err != nil {
 		log.Fatal(err)
 	}

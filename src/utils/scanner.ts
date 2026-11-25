@@ -53,6 +53,12 @@ export interface ScanResult {
     speedMbps?: number;
     /** 结果来源：cf / cm / domain / third */
     source?: SourceKind;
+    /** 每条源的标签（如 'CF官方IP段'、'bestcf.pages.dev/domain/all.txt'、'手动粘贴'）；
+     *  用于扫完后的按源汇总，与 source（SourceKind）分开保存，不影响结果筛选。 */
+    sourceLabel?: string;
+    /** 域名源时 DoH 解析出的实际连接 IP（展示仍用域名）；单条探针/测速用它直连，
+     *  避免对域名重新解析到另一个 IP。IP 源时与 ip 相同。 */
+    resolvedIp?: string;
 }
 
 /** 前端可自定义的扫描参数（保存后下次沿用，见 DEFAULT_SCAN_PARAMS） */
