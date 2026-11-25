@@ -18,6 +18,9 @@ import {
     resolveDomainToIp,
     DEFAULT_SCAN_PARAMS,
     ASIAN_COLOS,
+    COMMON_COLOS,
+    US_COLOS,
+    EU_COLOS,
     CF_PORTS,
     isQualified,
     parseDirectEntries,
@@ -808,26 +811,32 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                 </div>
             </div>
 
-            {/* 机房筛选 */}
+            {/* 机房筛选：常用机房全有（亚洲 + 美国 + 欧洲），默认只勾亚洲 5 个 */}
             <div className="mb-4">
                 <label className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">机房筛选:</label>
-                <div className="flex flex-wrap gap-2">
-                    {ASIAN_COLOS.map(colo => {
-                        const checked = coloFilter.includes(colo);
-                        return (
-                            <label key={colo} className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-full border cursor-pointer transition-colors ${checked ? 'bg-indigo-50 text-indigo-700 border-indigo-200 dark:bg-indigo-900/40 dark:text-indigo-200 dark:border-indigo-700/60' : 'bg-gray-100 text-gray-500 border-gray-200 dark:bg-gray-700 dark:text-gray-400 dark:border-gray-600'}`}>
-                                <input
-                                    type="checkbox"
-                                    checked={checked}
-                                    disabled={isScanning || isPreparing}
-                                    onChange={() => setColoFilter(prev => prev.includes(colo) ? prev.filter(c => c !== colo) : [...prev, colo])}
-                                    className="h-3.5 w-3.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
-                                />
-                                {colo}
-                            </label>
-                        );
-                    })}
+                <div className="space-y-2">
+                    {([['亚洲', ASIAN_COLOS], ['美国', US_COLOS], ['欧洲', EU_COLOS]] as const).map(([region, colos]) => (
+                        <div key={region} className="flex flex-wrap items-center gap-2">
+                            <span className="w-10 text-xs font-medium text-gray-500 dark:text-gray-400">{region}</span>
+                            {colos.map(colo => {
+                                const checked = coloFilter.includes(colo);
+                                return (
+                                    <label key={colo} className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-full border cursor-pointer transition-colors ${checked ? 'bg-indigo-50 text-indigo-700 border-indigo-200 dark:bg-indigo-900/40 dark:text-indigo-200 dark:border-indigo-700/60' : 'bg-gray-100 text-gray-500 border-gray-200 dark:bg-gray-700 dark:text-gray-400 dark:border-gray-600'}`}>
+                                        <input
+                                            type="checkbox"
+                                            checked={checked}
+                                            disabled={isScanning || isPreparing}
+                                            onChange={() => setColoFilter(prev => prev.includes(colo) ? prev.filter(c => c !== colo) : [...prev, colo])}
+                                            className="h-3.5 w-3.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                                        />
+                                        {colo}
+                                    </label>
+                                );
+                            })}
+                        </div>
+                    ))}
                 </div>
+                <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">共 {COMMON_COLOS.length} 个常用机房，默认只勾亚洲 5 个，需要时再勾其他机房</p>
             </div>
 
             {/* ============ 本地后端 ============ */}
