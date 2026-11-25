@@ -1,11 +1,18 @@
 import { useState, useEffect } from 'react';
 import { getScenes, getSceneResults, saveResults } from '../api';
 import { getLatencyColor, ScanResult, SOURCE_LABELS } from '../utils/scanner';
+import {
+    probeLocalAgent, probeSingle, speedSingle, DEFAULT_AGENT_PORT, AGENT_BUSY_ERROR,
+    type SingleProbeResult, type SingleSpeedResult,
+} from '../utils/localAgent';
 import { getColoName } from '../utils/colo';
 import { useToast } from './Toast';
 import { useConfirm } from './ConfirmDialog'; // Import Trash2 and RotateCw
 import { ListChecks, Trash2, RotateCw, FileText, File, Copy } from 'lucide-react';
 import { RegionDisplay } from './RegionDisplay';
+
+/** 与 ScannerConfig 的探针域名输入框共用同一个 localStorage 键 */
+const PROBE_HOST_KEY = 'CF_PROBE_HOST';
 
 // Type for data stored in KV, which does not include `isAvailable`
 interface SavedIpData {
@@ -19,6 +26,8 @@ interface SavedIpData {
     jitterMs?: number;
     speedMbps?: number;
     source?: 'cf' | 'cm' | 'domain' | 'third';
+    /** 域名源解析出的实际连接 IP（保存时随结果一起存入） */
+    resolvedIp?: string;
 }
 interface FlatIpItem extends SavedIpData {
     sceneName: string;
@@ -32,9 +41,147 @@ export function SavedIpList() {
     const { showToast } = useToast();
     const { confirm } = useConfirm();
 
+    // ---------- 批量按需测试（勾选 + 右上角一键探针复检 / 一键测速） ----------
+    interface RowTest {
+        probe?: SingleProbeResult;
+        speed?: SingleSpeedResult;
+        testing?: 'probe' | 'speed';
+    }
+    const [rowTests, setRowTests] = useState<Record<string, RowTest>>({});
+    /** 正在跑的批量测试：种类 + 进度（已完成 / 总数） */
+    const [batchKind, setBatchKind] = useState<'probe' | 'speed' | null>(null);
+    const [batchDone, setBatchDone] = useState(0);
+    const [batchTotal, setBatchTotal] = useState(0);
+    // 本地后端地址：首次测试时用 probeLocalAgent 自行探测并记住，
+    // 与 ScannerConfig / ScannerResults 共用同一后端（默认 13335）。
+    const [agentBase, setAgentBase] = useState<string | null>(null);
+
+    const itemKey = (item: FlatIpItem) => `${item.ip}:${item.port}#${item.sceneName}`;
+
+    const getAgentBase = async (): Promise<string | null> => {
+        if (agentBase) return agentBase;
+        const port = Number(localStorage.getItem('LOCAL_AGENT_PORT') || '') || DEFAULT_AGENT_PORT;
+        const r = await probeLocalAgent(port);
+        if (!r.online) {
+            showToast('本地后端未连接，请先启动本地后端', 'error');
+            return null;
+        }
+        setAgentBase(r.baseUrl);
+        return r.baseUrl;
+    };
+
+    /** 整轮扫描进行中时不测：先查 /status，收到后端 409 也一样处理 */
+    const checkBusy = async (base: string): Promise<boolean> => {
+        try {
+            const res = await fetch(`${base}/status`);
+            const s = await res.json() as { running?: boolean };
+            if (s?.running) {
+                showToast('请等扫描结束再测', 'warning');
+                return true;
+            }
+        } catch {
+            // 查不到就交给后端 409 判断
+        }
+        return false;
+    };
+
+    const readProbeHost = (): string => {
+        try { return (localStorage.getItem(PROBE_HOST_KEY) || '').trim(); } catch { return ''; }
+    };
+
+    /**
+     * 测其中一行（不触发整轮扫描，不改动已保存数据，只显示结果）。
+     * 返回 false 表示后端正忙（409），调用方应停止整批；其它单条失败
+     * 只记为不通 / 测速失败，不中断整批。
+     */
+    const runSingleTest = async (item: FlatIpItem, kind: 'probe' | 'speed', base: string): Promise<boolean> => {
+        const key = itemKey(item);
+        setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: kind } }));
+        const req = {
+            host: item.ip,
+            ip: item.resolvedIp || item.ip,
+            port: item.port,
+            probeHost: readProbeHost(),
+            speedUrl: 'auto',
+            timeoutMs: 5000,
+        };
+        try {
+            if (kind === 'probe') {
+                const res = await probeSingle(base, req);
+                setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: undefined, probe: res } }));
+            } else {
+                const res = await speedSingle(base, req);
+                setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: undefined, speed: res } }));
+            }
+            return true;
+        } catch (e) {
+            if (e instanceof Error && e.message === AGENT_BUSY_ERROR) {
+                setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: undefined } }));
+                return false;
+            }
+            setRowTests(prev => ({
+                ...prev,
+                [key]: {
+                    ...prev[key],
+                    testing: undefined,
+                    ...(kind === 'probe'
+                        ? { probe: { ok: false, error: e instanceof Error ? e.message : '未知错误' } }
+                        : { speed: { ok: false, error: e instanceof Error ? e.message : '未知错误' } }),
+                },
+            }));
+            return true;
+        }
+    };
+
+    /** 一键批量测试：只测已勾选且当前可见的行，最多 4 个并发 */
+    const runBatch = async (kind: 'probe' | 'speed', targets: FlatIpItem[]) => {
+        if (batchKind) return;
+        if (targets.length === 0) {
+            showToast('请先勾选要测试的 IP', 'warning');
+            return;
+        }
+        const base = await getAgentBase();
+        if (!base) return;
+        if (await checkBusy(base)) return;
+        setBatchKind(kind);
+        setBatchDone(0);
+        setBatchTotal(targets.length);
+        const busy = { value: false };
+        let idx = 0;
+        const worker = async () => {
+            while (idx < targets.length && !busy.value) {
+                const item = targets[idx++];
+                const ok = await runSingleTest(item, kind, base);
+                if (!ok) {
+                    busy.value = true;
+                    break;
+                }
+                setBatchDone(d => d + 1);
+            }
+        };
+        try {
+            await Promise.all(Array.from({ length: Math.min(4, targets.length) }, () => worker()));
+        } finally {
+            setBatchKind(null);
+        }
+        if (busy.value) {
+            showToast('请等扫描结束再测', 'warning');
+            return;
+        }
+        if (kind === 'probe') {
+            showToast(`探针复检完成：共 ${targets.length} 个`, 'success');
+        } else {
+            showToast(`测速完成：共 ${targets.length} 个`, 'success');
+        }
+    };
+
     const loadData = async () => {
         setLoading(true);
         setItems([]); // Clear items before loading to avoid confusion
+        setRowTests({});
+        setBatchKind(null);
+        setBatchDone(0);
+        setBatchTotal(0);
         try {
             // 1. 获取所有场景名
             const scenes = await getScenes();
@@ -71,6 +218,16 @@ export function SavedIpList() {
     const filteredItemsSorted = [...filteredItems].sort((a, b) => {
         return a.latency - b.latency;
     });
+
+    /** 批量测试的入口：从当前可见行里取已勾选的 */
+    const handleBatchClick = (kind: 'probe' | 'speed') => {
+        const targets = filteredItemsSorted.filter(item => selectedItems.has(itemKey(item)));
+        if (targets.length === 0) {
+            showToast('请先勾选要测试的 IP', 'warning');
+            return;
+        }
+        void runBatch(kind, targets);
+    };
 
     const handleCheckboxChange = (id: string, checked: boolean) => {
         const newSet = new Set(selectedItems);
@@ -255,6 +412,24 @@ export function SavedIpList() {
                             <RotateCw className="w-4 h-4 mr-1 inline-block" />
                             刷新
                         </button>
+                        {/* 批量测试：只测已勾选的行，最多 4 个并发 */}
+                        <span className="text-xs text-gray-500 dark:text-gray-400">已勾选 {selectedItems.size} 个</span>
+                        <button
+                            type="button"
+                            onClick={() => handleBatchClick('probe')}
+                            disabled={batchKind !== null}
+                            className="px-4 py-1.5 text-sm font-medium text-teal-800 bg-teal-100 rounded-full hover:bg-teal-200 dark:bg-teal-900 dark:text-teal-300 dark:hover:bg-teal-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                            {batchKind === 'probe' ? `探针复检中 ${batchDone}/${batchTotal}…` : '一键探针复检'}
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => handleBatchClick('speed')}
+                            disabled={batchKind !== null}
+                            className="px-4 py-1.5 text-sm font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                            {batchKind === 'speed' ? `测速中 ${batchDone}/${batchTotal}…` : '一键测速'}
+                        </button>
                     </div>
                 </div>
 
@@ -324,13 +499,14 @@ export function SavedIpList() {
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">地区代码</th>
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">地区</th>
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">场景</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">复检结果</th>
                         </tr>
                     </thead>
                     <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
                         {loading ? (
-                            <tr><td colSpan={10} className="px-4 py-4 text-center text-gray-500">加载中...</td></tr>
+                            <tr><td colSpan={11} className="px-4 py-4 text-center text-gray-500">加载中...</td></tr>
                         ) : filteredItems.length === 0 ? (
-                            <tr><td colSpan={10} className="px-4 py-4 text-center text-gray-500">暂无数据</td></tr>
+                            <tr><td colSpan={11} className="px-4 py-4 text-center text-gray-500">暂无数据</td></tr>
                         ) : (
                             filteredItemsSorted.map((item) => (
                                 <tr key={`${item.ip}-${item.port}-${item.sceneName}`} className="hover:bg-gray-50 dark:hover:bg-gray-700">
@@ -356,6 +532,31 @@ export function SavedIpList() {
                                     <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{item.colo || '-'}</td>
                                     <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{item.colo ? <RegionDisplay colo={item.colo} flagSize="sm" /> : '-'}</td>
                                     <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{item.sceneName}</td>
+                                    <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                        {(() => {
+                                            const t = rowTests[itemKey(item)];
+                                            return (
+                                                <div className="flex flex-col gap-1">
+                                                    {t?.testing === 'probe' && <span className="text-teal-600">探针中…</span>}
+                                                    {t?.testing === 'speed' && <span className="text-blue-600">测速中…</span>}
+                                                    {t?.probe && (
+                                                        <span className={t.probe.ok ? 'text-green-600' : 'text-red-600'}>
+                                                            {t.probe.ok
+                                                                ? `通${t.probe.colo ? ` ${t.probe.colo}` : ''}${t.probe.latencyMs !== undefined ? ` ${t.probe.latencyMs}ms` : ''}`
+                                                                : '不通'}
+                                                        </span>
+                                                    )}
+                                                    {t?.speed && (
+                                                        <span className={t.speed.ok ? 'text-blue-600' : 'text-red-600'}>
+                                                            {t.speed.ok && t.speed.speedMbps !== undefined
+                                                                ? `${t.speed.speedMbps.toFixed(1)} MB/s`
+                                                                : '测速失败'}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            );
+                                        })()}
+                                    </td>
                                 </tr>
                             ))
                         )}

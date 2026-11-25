@@ -37,17 +37,32 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
     const [selectedSources, setSelectedSources] = useState<Set<SourceKind>>(new Set());
     const filterInitialized = useRef(false);
 
-    // ---------- 单条按需测试（每行“探针”“测速”按钮，不触发整轮扫描） ----------
+    // ---------- 批量按需测试（勾选 + 右上角一键探针复检 / 一键测速） ----------
     interface RowTest {
         probe?: SingleProbeResult;
         speed?: SingleSpeedResult;
         testing?: 'probe' | 'speed';
     }
     const [rowTests, setRowTests] = useState<Record<string, RowTest>>({});
+    /** 已勾选的行，键为 `${ip}:${port}` */
+    const [checkedKeys, setCheckedKeys] = useState<Set<string>>(new Set());
+    /** 正在跑的批量测试：种类 + 进度（已完成 / 总数） */
+    const [batchKind, setBatchKind] = useState<'probe' | 'speed' | null>(null);
+    const [batchDone, setBatchDone] = useState(0);
+    const [batchTotal, setBatchTotal] = useState(0);
     // 本地后端地址：首次测试时用 probeLocalAgent 自行探测并记住，
     // 与 ScannerConfig 共用同一后端（默认 13335，LOCAL_AGENT_PORT 可改）。
     const [agentBase, setAgentBase] = useState<string | null>(null);
     const { showToast } = useToast();
+
+    // 新一轮扫描结果来了（或结果被清空）：复检结果和勾选一并清掉
+    useEffect(() => {
+        setRowTests({});
+        setCheckedKeys(new Set());
+        setBatchKind(null);
+        setBatchDone(0);
+        setBatchTotal(0);
+    }, [scanResults]);
 
     const getAgentBase = async (): Promise<string | null> => {
         if (agentBase) return agentBase;
@@ -80,12 +95,14 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
         try { return (localStorage.getItem(PROBE_HOST_KEY) || '').trim(); } catch { return ''; }
     };
 
-    const runRowTest = async (row: ScanResult, kind: 'probe' | 'speed') => {
-        const key = `${row.ip}:${row.port}`;
-        if (rowTests[key]?.testing) return;
-        const base = await getAgentBase();
-        if (!base) return;
-        if (await checkBusy(base)) return;
+    const rowKey = (row: Pick<ScanResult, 'ip' | 'port'>) => `${row.ip}:${row.port}`;
+
+    /**
+     * 测其中一行（不触发整轮扫描）。返回 false 表示后端正忙（409），
+     * 调用方应停止整批；其它单条失败只记为不通 / 测速失败，不中断整批。
+     */
+    const runSingleTest = async (row: ScanResult, kind: 'probe' | 'speed', base: string): Promise<boolean> => {
+        const key = rowKey(row);
         setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: kind } }));
         const req = {
             host: row.ip,
@@ -103,13 +120,24 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                 const res = await speedSingle(base, req);
                 setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: undefined, speed: res } }));
             }
+            return true;
         } catch (e) {
             if (e instanceof Error && e.message === AGENT_BUSY_ERROR) {
-                showToast('请等扫描结束再测', 'warning');
-            } else {
-                showToast(`测试失败: ${e instanceof Error ? e.message : '未知错误'}`, 'error');
+                setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: undefined } }));
+                return false;
             }
-            setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: undefined } }));
+            // 网络失败等单条错误：记为该项失败，不弹 toast、不中断整批
+            setRowTests(prev => ({
+                ...prev,
+                [key]: {
+                    ...prev[key],
+                    testing: undefined,
+                    ...(kind === 'probe'
+                        ? { probe: { ok: false, error: e instanceof Error ? e.message : '未知错误' } }
+                        : { speed: { ok: false, error: e instanceof Error ? e.message : '未知错误' } }),
+                },
+            }));
+            return true;
         }
     };
 
@@ -202,6 +230,77 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
         });
     }
 
+    // ---------- 批量测试：勾选 + 全选 ----------
+    const checkedVisibleCount = limitedResults.filter(r => checkedKeys.has(rowKey(r))).length;
+    const allVisibleChecked = limitedResults.length > 0 && checkedVisibleCount === limitedResults.length;
+    const toggleSelectAllVisible = () => {
+        if (allVisibleChecked) {
+            setCheckedKeys(prev => {
+                const next = new Set(prev);
+                for (const r of limitedResults) next.delete(rowKey(r));
+                return next;
+            });
+        } else {
+            setCheckedKeys(prev => {
+                const next = new Set(prev);
+                for (const r of limitedResults) next.add(rowKey(r));
+                return next;
+            });
+        }
+    };
+    const toggleRowChecked = (row: ScanResult) => {
+        const key = rowKey(row);
+        setCheckedKeys(prev => {
+            const next = new Set(prev);
+            if (next.has(key)) next.delete(key);
+            else next.add(key);
+            return next;
+        });
+    };
+
+    /** 一键批量测试：只测已勾选且当前可见的行，最多 4 个并发 */
+    const runBatch = async (kind: 'probe' | 'speed') => {
+        if (batchKind) return;
+        const targets = limitedResults.filter(r => checkedKeys.has(rowKey(r)));
+        if (targets.length === 0) {
+            showToast('请先勾选要测试的 IP', 'warning');
+            return;
+        }
+        const base = await getAgentBase();
+        if (!base) return;
+        if (await checkBusy(base)) return;
+        setBatchKind(kind);
+        setBatchDone(0);
+        setBatchTotal(targets.length);
+        const busy = { value: false };
+        let idx = 0;
+        const worker = async () => {
+            while (idx < targets.length && !busy.value) {
+                const row = targets[idx++];
+                const ok = await runSingleTest(row, kind, base);
+                if (!ok) {
+                    busy.value = true;
+                    break;
+                }
+                setBatchDone(d => d + 1);
+            }
+        };
+        try {
+            await Promise.all(Array.from({ length: Math.min(4, targets.length) }, () => worker()));
+        } finally {
+            setBatchKind(null);
+        }
+        if (busy.value) {
+            showToast('请等扫描结束再测', 'warning');
+            return;
+        }
+        if (kind === 'probe') {
+            showToast(`探针复检完成：共 ${targets.length} 个`, 'success');
+        } else {
+            showToast(`测速完成：共 ${targets.length} 个`, 'success');
+        }
+    };
+
     const handleSave = async () => {
         if (filteredResults.length === 0) {
             showToast('没有可保存的结果。', 'warning');
@@ -238,7 +337,7 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
             {scanResults.length > 0 ? (
                 <>
                     <div className="p-3 mb-4 bg-gray-50 dark:bg-gray-700 rounded-lg">
-                        <div className="flex items-center gap-4 mb-4 pb-3 border-b border-gray-200 dark:border-gray-600">
+                        <div className="flex items-center justify-between gap-4 mb-4 pb-3 border-b border-gray-200 dark:border-gray-600">
                             <div className="flex items-center gap-4 flex-wrap">
                                 <h3 className="text-sm font-bold text-gray-700 dark:text-gray-200">筛选与操作:</h3>
                                 <div className="flex items-center gap-2">
@@ -299,6 +398,34 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                                     <span className="text-sm text-gray-600 dark:text-gray-300">个</span>
                                     {ipsPerRegionError && <span className="text-red-500 text-xs">{ipsPerRegionError}</span>}
                                 </div>
+                            </div>
+                            {/* 批量测试：只测已勾选的行，最多 4 个并发 */}
+                            <div className="flex items-center gap-2 shrink-0 flex-wrap">
+                                <span className="text-xs text-gray-500 dark:text-gray-400">已勾选 {checkedVisibleCount} 个</span>
+                                <button
+                                    type="button"
+                                    onClick={toggleSelectAllVisible}
+                                    disabled={limitedResults.length === 0}
+                                    className="px-3 py-1 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    {allVisibleChecked ? '取消全选' : '全选'}
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => void runBatch('probe')}
+                                    disabled={batchKind !== null}
+                                    className="px-3 py-1 text-xs font-medium text-teal-800 bg-teal-100 rounded-full hover:bg-teal-200 dark:bg-teal-900 dark:text-teal-300 dark:hover:bg-teal-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    {batchKind === 'probe' ? `探针复检中 ${batchDone}/${batchTotal}…` : '一键探针复检'}
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => void runBatch('speed')}
+                                    disabled={batchKind !== null}
+                                    className="px-3 py-1 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    {batchKind === 'speed' ? `测速中 ${batchDone}/${batchTotal}…` : '一键测速'}
+                                </button>
                             </div>
                         </div>
 
@@ -442,6 +569,17 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                     <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
                         <thead className="bg-gray-50 dark:bg-gray-700 sticky top-0">
                             <tr>
+                                <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                                    <input
+                                        type="checkbox"
+                                        aria-label="全选当前可见结果"
+                                        checked={allVisibleChecked}
+                                        ref={el => { if (el) el.indeterminate = limitedResults.length > 0 && checkedVisibleCount > 0 && checkedVisibleCount < limitedResults.length; }}
+                                        onChange={toggleSelectAllVisible}
+                                        disabled={limitedResults.length === 0}
+                                        className="h-4 w-4 rounded border-gray-300 text-purple-600 focus:ring-purple-500 disabled:opacity-50"
+                                    />
+                                </th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">IP/域名</th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">来源</th>
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">端口</th>
@@ -450,12 +588,25 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">丢包</th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">抖动</th>
                                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">地区</th>
-                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">测试</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">复检结果</th>
                             </tr>
                         </thead>
                         <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                            {limitedResults.map(({ ip, port, latency, colo, domain, latencies, lossPct, jitterMs, source, resolvedIp, sourceLabel }) => (
-                                <tr key={`${ip}:${port}`} className="hover:bg-gray-100 dark:hover:bg-gray-700">
+                            {limitedResults.map((row) => {
+                                const { ip, port, latency, colo, domain, latencies, lossPct, jitterMs, source } = row;
+                                const key = `${ip}:${port}`;
+                                const t = rowTests[key];
+                                return (
+                                <tr key={key} className="hover:bg-gray-100 dark:hover:bg-gray-700">
+                                    <td className="px-3 py-4 whitespace-nowrap">
+                                        <input
+                                            type="checkbox"
+                                            aria-label={`勾选 ${ip}:${port}`}
+                                            checked={checkedKeys.has(key)}
+                                            onChange={() => toggleRowChecked(row)}
+                                            className="h-4 w-4 rounded border-gray-300 text-purple-600 focus:ring-purple-500"
+                                        />
+                                    </td>
                                     <td className="px-6 py-4 whitespace-nowrap text-sm font-mono text-gray-900 dark:text-white">
                                         {ip}
                                         {domain && <span className="ml-2 px-1.5 py-0.5 text-[10px] rounded bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300">域名</span>}
@@ -468,50 +619,28 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{jitterMs !== undefined ? `${jitterMs}ms` : '-'}</td>
                                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{colo ? <RegionDisplay colo={colo} flagSize="sm" /> : '-'}</td>
                                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                                        {(() => {
-                                            const key = `${ip}:${port}`;
-                                            const t = rowTests[key];
-                                            const busy = t?.testing !== undefined;
-                                            return (
-                                                <div className="flex flex-col gap-1">
-                                                    <div className="flex gap-1">
-                                                        <button
-                                                            type="button"
-                                                            disabled={busy}
-                                                            onClick={() => void runRowTest({ ip, port, latency, colo, domain, latencies, lossPct, jitterMs, source, resolvedIp, sourceLabel, isAvailable: true } as ScanResult, 'probe')}
-                                                            className="px-2 py-0.5 text-xs font-medium rounded-full bg-teal-100 text-teal-700 hover:bg-teal-200 dark:bg-teal-900/40 dark:text-teal-300 dark:hover:bg-teal-800/60 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                                        >
-                                                            {t?.testing === 'probe' ? '探针中…' : '探针'}
-                                                        </button>
-                                                        <button
-                                                            type="button"
-                                                            disabled={busy}
-                                                            onClick={() => void runRowTest({ ip, port, latency, colo, domain, latencies, lossPct, jitterMs, source, resolvedIp, sourceLabel, isAvailable: true } as ScanResult, 'speed')}
-                                                            className="px-2 py-0.5 text-xs font-medium rounded-full bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/40 dark:text-blue-300 dark:hover:bg-blue-800/60 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                                        >
-                                                            {t?.testing === 'speed' ? '测速中…' : '测速'}
-                                                        </button>
-                                                    </div>
-                                                    {t?.probe && (
-                                                        <span className={t.probe.ok ? 'text-green-600' : 'text-red-600'}>
-                                                            {t.probe.ok
-                                                                ? `通${t.probe.colo ? ` ${t.probe.colo}` : ''}${t.probe.latencyMs !== undefined ? ` ${t.probe.latencyMs}ms` : ''}`
-                                                                : '不通'}
-                                                        </span>
-                                                    )}
-                                                    {t?.speed && (
-                                                        <span className={t.speed.ok ? 'text-blue-600' : 'text-red-600'}>
-                                                            {t.speed.ok && t.speed.speedMbps !== undefined
-                                                                ? `${t.speed.speedMbps.toFixed(1)} MB/s`
-                                                                : '测速失败'}
-                                                        </span>
-                                                    )}
-                                                </div>
-                                            );
-                                        })()}
+                                        <div className="flex flex-col gap-1">
+                                            {t?.testing === 'probe' && <span className="text-teal-600">探针中…</span>}
+                                            {t?.testing === 'speed' && <span className="text-blue-600">测速中…</span>}
+                                            {t?.probe && (
+                                                <span className={t.probe.ok ? 'text-green-600' : 'text-red-600'}>
+                                                    {t.probe.ok
+                                                        ? `通${t.probe.colo ? ` ${t.probe.colo}` : ''}${t.probe.latencyMs !== undefined ? ` ${t.probe.latencyMs}ms` : ''}`
+                                                        : '不通'}
+                                                </span>
+                                            )}
+                                            {t?.speed && (
+                                                <span className={t.speed.ok ? 'text-blue-600' : 'text-red-600'}>
+                                                    {t.speed.ok && t.speed.speedMbps !== undefined
+                                                        ? `${t.speed.speedMbps.toFixed(1)} MB/s`
+                                                        : '测速失败'}
+                                                </span>
+                                            )}
+                                        </div>
                                     </td>
                                 </tr>
-                            ))}
+                                );
+                            })}
                         </tbody>
                     </table>
                 </div>
