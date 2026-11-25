@@ -256,21 +256,13 @@ func httpingRound(ip string, port int, host string, timeout time.Duration) (ttfb
 	return ms(firstByte.Sub(start)), tcpMs, tlsMs, nil
 }
 
-// probeConnectivity dials ip:port and reads /cdn-cgi/trace, which doubles
-// as the connectivity probe and the colo detector.
-//   - TLS ports (443/2053/2083/2087/2096/8443): TLS handshake with
-//     SNI = probeHost (a node domain, e.g. jpagxr.sidns.xyz) when it is a
-//     non-empty domain, else speed.cloudflare.com.
-//   - Other ports: plain HTTP, Host = the same SNI.
-// Returns (colo, loc, ok); ok is false on dial / TLS / HTTP error.
-// A successful trace always parses colo=/loc= when the edge returns them.
-func probeConnectivity(ip string, port int, timeout time.Duration, probeHost string) (string, string, bool) {
-	sni := strings.TrimSpace(probeHost)
-	if sni == "" || !isDomain(sni) {
-		sni = "speed.cloudflare.com"
-	}
-	useTLS := tlsPorts[port]
-	dialer := &net.Dialer{Timeout: timeout}
+// fetchTrace dials ip:port and reads /cdn-cgi/trace with the given SNI,
+// only to learn the edge's colo=/loc=. Returns (colo, loc, ok); ok is
+// true only on HTTP 2xx with a colo= line. A plain non-CF server does
+// not serve a trace, so it never passes here — but that only affects
+// the colo lookup, never the connectivity verdict (see probeConnectivity).
+func fetchTrace(ctx context.Context, ip string, port int, useTLS bool, sni string) (string, string, bool) {
+	dialer := &net.Dialer{}
 	transport := &http.Transport{
 		Proxy: nil, // direct dial only: never use HTTP_PROXY/HTTPS_PROXY
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -281,12 +273,12 @@ func probeConnectivity(ip string, port int, timeout time.Duration, probeHost str
 	if useTLS {
 		transport.TLSClientConfig = &tls.Config{ServerName: sni, InsecureSkipVerify: true} //nolint:gosec // IP dial: cert cannot match; SNI is what matters
 	}
-	client := &http.Client{Transport: transport, Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	scheme := "http"
 	if useTLS {
 		scheme = "https"
 	}
-	req, err := http.NewRequest(http.MethodGet, scheme+"://"+sni+"/cdn-cgi/trace", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, scheme+"://"+sni+"/cdn-cgi/trace", nil)
 	if err != nil {
 		return "", "", false
 	}
@@ -300,10 +292,6 @@ func probeConnectivity(ip string, port int, timeout time.Duration, probeHost str
 	if err != nil {
 		return "", "", false
 	}
-	// The endpoint must actually serve a Cloudflare trace: HTTP 2xx and a
-	// colo= line. A plain HTTP server answering 404 (or any non-CF body)
-	// does NOT count as a successful probe — otherwise any open port
-	// would pass the connectivity check.
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", "", false
 	}
@@ -323,6 +311,53 @@ func probeConnectivity(ip string, port int, timeout time.Duration, probeHost str
 	if colo == "" {
 		return "", "", false
 	}
+	return colo, loc, true
+}
+
+// probeConnectivity checks whether ip:port is usable as a preferred IP
+// for the node. The verdict comes from the transport handshake only —
+// it must NOT depend on /cdn-cgi/trace under the probeHost SNI, because
+// a tunnel domain (e.g. jpagxr.sidns.xyz) is forwarded by the Cloudflare
+// edge through the tunnel to the Xray origin, which does not serve
+// /cdn-cgi/trace at all; the old code therefore reported every good
+// preferred IP as 不通. Real use is TLS + xhttp to that SNI, not an
+// HTTP GET of the trace path, so a successful handshake is the correct
+// "usable" signal.
+//   - TLS ports (443/2053/2083/2087/2096/8443): TLS handshake with
+//     SNI = probeHost (a node domain) when it is a non-empty domain,
+//     else speed.cloudflare.com. Handshake success = 通. A plain
+//     non-CF server cannot complete a TLS handshake, so it still fails.
+//   - Other ports: plain TCP dial. Dial success = 通 (a TCP connect
+//     that succeeds but whose trace lookup fails still counts as 通:
+//     the port is open and reachable; the trace is only a colo hint).
+// Colo/loc are then looked up separately with SNI = speed.cloudflare.com
+// (a Cloudflare-hosted site whose trace the edge always serves). If
+// that lookup fails, ok stays true and colo/loc are left empty.
+// Returns (colo, loc, ok); ok is false only on dial / TLS handshake failure.
+func probeConnectivity(ip string, port int, timeout time.Duration, probeHost string) (string, string, bool) {
+	sni := strings.TrimSpace(probeHost)
+	if sni == "" || !isDomain(sni) {
+		sni = "speed.cloudflare.com"
+	}
+	useTLS := tlsPorts[port]
+	// One deadline bounds both steps (handshake + colo lookup).
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	addr := net.JoinHostPort(ip, strconv.Itoa(port))
+	if useTLS {
+		conn, err := tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", addr, &tls.Config{ServerName: sni, InsecureSkipVerify: true}) //nolint:gosec // IP dial: cert cannot match; SNI is what matters
+		if err != nil {
+			return "", "", false
+		}
+		_ = conn.Close()
+	} else {
+		conn, err := (&net.Dialer{Timeout: timeout}).DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return "", "", false
+		}
+		_ = conn.Close()
+	}
+	colo, loc, _ := fetchTrace(ctx, ip, port, useTLS, "speed.cloudflare.com")
 	return colo, loc, true
 }
 
@@ -409,7 +444,9 @@ func measureTarget(ctx context.Context, t Target, p ScanPayload) *AgentResult {
 			return p.Source
 		}(),
 	}
-	// 连通性探针 + 机房识别，只对达标候选做一次。
+	// 连通性探针 + 机房识别，只对达标候选做一次。探针以 TLS 握手
+	// （SNI = 节点域名）定通不通，机房另用 speed.cloudflare.com 的
+	// trace 拿，拿不到机房不判不通。
 	// probeHost 填了节点域名时，探针失败 = 这个优选 IP 连不上该节点，
 	// 直接丢掉；留空时沿用旧行为，探针失败不丢结果（colo/loc 留空）。
 	probeHost := strings.TrimSpace(p.ProbeHost)
@@ -562,7 +599,7 @@ func handleProbe(w http.ResponseWriter, r *http.Request) {
 	colo, loc, ok := probeConnectivity(req.IP, req.Port, timeout, req.ProbeHost)
 	resp := probeResp{OK: ok, Colo: colo, Loc: loc, LatencyMs: ms(time.Since(start))}
 	if !ok {
-		resp.Error = "探针连接失败（TLS 握手或 HTTP 请求失败）"
+		resp.Error = "探针连接失败（TLS 握手失败或端口不通）"
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

@@ -89,12 +89,15 @@ rounds 3、jitter 50/100、topN 20、scanMode tcping、机房默认
 - **达标判定**（缺一不可）：至少成功 1 次；最好延迟 ≤
   `latencyLimit`；丢包率 ≤ `lossLimit`。例如 rounds=3、
   lossLimit=10 时，3 次必须全成功才算达标。
-- **机房识别 + 连通性探针**：只对达标候选做一次拨号读 `/cdn-cgi/trace`，
-  取 `colo=` / `loc=`。SNI 用 `probeHost`（节点域名，如
-  `jpagxr.sidns.xyz`），留空时用 `speed.cloudflare.com`；TLS 端口
-  （443/2053/2083/2087/2096/8443）走 TLS，非 TLS 端口走明文 HTTP。
-  `probeHost` 填了时探针失败（TLS 握手或 HTTP 请求失败）= 这个优选 IP
-  连不上该节点，直接丢掉；留空时探针失败不丢结果（colo/loc 留空）。
+- **机房识别 + 连通性探针**：只对达标候选做一次。探针 = 用节点域名
+  作 SNI 对该 IP:端口做一次 TLS 握手（TLS 端口 443/2053/2083/
+  2087/2096/8443；非 TLS 端口走明文 TCP 拨号），握手通即为可用。
+  机房信息另外用 `speed.cloudflare.com` 的 `/cdn-cgi/trace` 拿
+  （取 `colo=` / `loc=`），拿不到机房也不判不通。注意不要拿节点
+  域名去读 `/cdn-cgi/trace`：隧道域名经 Cloudflare 转发到 Xray
+  源站，源站不提供这个地址，读不到不代表 IP 不可用。`probeHost`
+  填了时探针失败（TLS 握手失败或端口不通）= 这个优选 IP 连不上
+  该节点，直接丢掉；留空时探针失败不丢结果（colo/loc 留空）。
   识别出机房且不在 `coloFilter` 里才丢弃。
 - **每条源标签**：每条目标可带 `source`（如 `CF官方IP段`、
   `bestcf.pages.dev/domain/all.txt`、`手动粘贴`），后端原样回传到
