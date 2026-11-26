@@ -230,6 +230,15 @@ export interface SingleSpeedResult {
     error?: string;
 }
 
+export interface SingleLatencyResult {
+    ok: boolean;
+    latency?: number;
+    latencies?: number[];
+    lossPct?: number;
+    jitterMs?: number;
+    error?: string;
+}
+
 export interface SingleTestReq {
     host: string;
     ip: string;
@@ -237,12 +246,16 @@ export interface SingleTestReq {
     probeHost?: string;
     speedUrl?: string;
     timeoutMs?: number;
+    /** 测延迟用：扫描方式 tcping/httping，默认 tcping */
+    scanMode?: string;
+    /** 测延迟用：测速轮次 1-5，默认 3 */
+    rounds?: number;
 }
 
 /** 后端 409（整轮扫描进行中）时抛出的错误标识，调用方据此提示“请等扫描结束再测” */
 export const AGENT_BUSY_ERROR = 'AGENT_BUSY';
 
-async function singleTest<T>(baseUrl: string, path: '/probe' | '/speed', req: SingleTestReq, timeoutMs: number): Promise<T> {
+async function singleTest<T>(baseUrl: string, path: '/probe' | '/speed' | '/latency', req: SingleTestReq, timeoutMs: number): Promise<T> {
     const res = await agentFetch(baseUrl, path, {
         method: 'POST',
         body: JSON.stringify(req),
@@ -260,4 +273,9 @@ export async function probeSingle(baseUrl: string, req: SingleTestReq): Promise<
 /** 单条下载测速：经该 IP:端口下载测速文件，最多约 10 MB 或 8 秒 */
 export async function speedSingle(baseUrl: string, req: SingleTestReq): Promise<SingleSpeedResult> {
     return singleTest<SingleSpeedResult>(baseUrl, '/speed', req, 15000);
+}
+
+/** 单条真延迟复测：按扫描轮次（默认 3 轮）重测该 IP:端口，返回最好一次延迟与丢包/抖动，不过滤 */
+export async function latencySingle(baseUrl: string, req: SingleTestReq): Promise<SingleLatencyResult> {
+    return singleTest<SingleLatencyResult>(baseUrl, '/latency', req, 30000);
 }

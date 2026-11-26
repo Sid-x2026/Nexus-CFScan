@@ -1,15 +1,18 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { getScenes, getSceneResults, saveResults, deleteScene } from '../api';
-import { getLatencyColor, ScanResult, SOURCE_LABELS } from '../utils/scanner';
+import { getLatencyColor, ScanResult, SOURCE_LABELS, DEFAULT_SCAN_PARAMS } from '../utils/scanner';
 import {
-    probeLocalAgent, probeSingle, speedSingle, DEFAULT_AGENT_PORT, AGENT_BUSY_ERROR,
-    type SingleProbeResult, type SingleSpeedResult,
+    probeLocalAgent, probeSingle, speedSingle, latencySingle, DEFAULT_AGENT_PORT, AGENT_BUSY_ERROR,
+    type SingleProbeResult, type SingleSpeedResult, type SingleLatencyResult,
 } from '../utils/localAgent';
 import { getColoName } from '../utils/colo';
 import { useToast } from './Toast';
 import { useConfirm } from './ConfirmDialog'; // Import Trash2 and RotateCw
 import { ListChecks, Trash2, RotateCw, FileText, File, Copy, ChevronDown, ChevronUp } from 'lucide-react';
 import { RegionDisplay } from './RegionDisplay';
+
+/** 与 ScannerConfig 的扫描参数共用同一个 localStorage 键：测延迟沿用其中的轮次/超时/方式 */
+const SCAN_PARAMS_KEY = 'CF_SCAN_PARAMS';
 
 /** 与 ScannerConfig 的探针域名输入框共用同一个 localStorage 键 */
 const PROBE_HOST_KEY = 'CF_PROBE_HOST';
@@ -51,17 +54,20 @@ export function SavedIpList() {
     const { showToast } = useToast();
     const { confirm } = useConfirm();
 
-    // ---------- 批量按需测试（勾选 + 右上角一键探针复检 / 一键测速） ----------
+    // ---------- 批量按需测试（勾选 + 右上角一键探针复检 / 一键测延迟 / 一键测下载速度） ----------
     interface RowTest {
         probe?: SingleProbeResult;
         speed?: SingleSpeedResult;
-        testing?: 'probe' | 'speed';
+        latency?: SingleLatencyResult;
+        testing?: 'probe' | 'speed' | 'latency';
     }
     const [rowTests, setRowTests] = useState<Record<string, RowTest>>({});
     /** 正在跑的批量测试：种类 + 进度（已完成 / 总数） */
-    const [batchKind, setBatchKind] = useState<'probe' | 'speed' | null>(null);
+    const [batchKind, setBatchKind] = useState<'probe' | 'speed' | 'latency' | null>(null);
     const [batchDone, setBatchDone] = useState(0);
     const [batchTotal, setBatchTotal] = useState(0);
+    /** 本批测延迟攒下的新延迟：整批跑完一次性写回已保存数据，避免 4 并发各写各的互相覆盖 */
+    const latencyUpdates = useRef<Record<string, { latency: number; latencies?: number[]; lossPct?: number; jitterMs?: number }>>({});
     // 本地后端地址：首次测试时用 probeLocalAgent 自行探测并记住，
     // 与 ScannerConfig / ScannerResults 共用同一后端（默认 13335）。
     const [agentBase, setAgentBase] = useState<string | null>(null);
@@ -99,26 +105,74 @@ export function SavedIpList() {
         try { return (localStorage.getItem(PROBE_HOST_KEY) || '').trim(); } catch { return ''; }
     };
 
+    /** 测延迟沿用扫描页的参数：轮次 / 超时 / 方式，改扫描参数即改这里 */
+    const readLatencyParams = (): { rounds: number; timeoutMs: number; scanMode: 'tcping' | 'httping' } => {
+        const fallback = { rounds: DEFAULT_SCAN_PARAMS.rounds, timeoutMs: DEFAULT_SCAN_PARAMS.timeoutMs, scanMode: DEFAULT_SCAN_PARAMS.scanMode };
+        try {
+            const raw = localStorage.getItem(SCAN_PARAMS_KEY);
+            if (!raw) return fallback;
+            const p = JSON.parse(raw);
+            return {
+                rounds: typeof p.rounds === 'number' && p.rounds >= 1 && p.rounds <= 5 ? p.rounds : fallback.rounds,
+                timeoutMs: typeof p.timeoutMs === 'number' && p.timeoutMs > 0 ? p.timeoutMs : fallback.timeoutMs,
+                scanMode: p.scanMode === 'httping' ? 'httping' : 'tcping',
+            };
+        } catch {
+            return fallback;
+        }
+    };
+
     /**
-     * 测其中一行（不触发整轮扫描，不改动已保存数据，只显示结果）。
-     * 返回 false 表示后端正忙（409），调用方应停止整批；其它单条失败
-     * 只记为不通 / 测速失败，不中断整批。
+     * 本批测延迟攒下的新延迟一次性写回：更新列表里的延迟/丢包/抖动并按新延迟重排，
+     * 再把涉及的场景整场景覆盖保存。失败的行不更新，留着旧值。
      */
-    const runSingleTest = async (item: FlatIpItem, kind: 'probe' | 'speed', base: string): Promise<boolean> => {
+    const persistLatencyUpdates = async (): Promise<number> => {
+        const updates = latencyUpdates.current;
+        const keys = Object.keys(updates);
+        if (keys.length === 0) return 0;
+        latencyUpdates.current = {};
+        const nextItems = items.map(it => {
+            const u = updates[itemKey(it)];
+            return u ? { ...it, latency: u.latency, latencies: u.latencies, lossPct: u.lossPct, jitterMs: u.jitterMs } : it;
+        });
+        setItems(nextItems);
+        const scenes = new Set(nextItems.filter(it => updates[itemKey(it)]).map(it => it.sceneName));
+        for (const scene of scenes) {
+            const sceneItems = nextItems.filter(i => i.sceneName === scene).map(({ sceneName, ...rest }) => rest);
+            await saveResults(scene, sceneItems as ScanResult[], 'overwrite');
+        }
+        return keys.length;
+    };
+
+    /**
+     * 测其中一行（不触发整轮扫描；探针/测速只显示结果不改数据，
+     * 测延迟成功后把新延迟攒起来，整批跑完一次性写回已保存数据并重排）。
+     * 返回 false 表示后端正忙（409），调用方应停止整批；其它单条失败
+     * 只记为不通 / 测速失败 / 测延迟失败，不中断整批。
+     */
+    const runSingleTest = async (item: FlatIpItem, kind: 'probe' | 'speed' | 'latency', base: string): Promise<boolean> => {
         const key = itemKey(item);
         setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: kind } }));
+        const latencyParams = kind === 'latency' ? readLatencyParams() : null;
         const req = {
             host: item.ip,
             ip: item.resolvedIp || item.ip,
             port: item.port,
             probeHost: readProbeHost(),
             speedUrl: 'auto',
-            timeoutMs: 5000,
+            timeoutMs: latencyParams ? latencyParams.timeoutMs : 5000,
+            ...(latencyParams ? { scanMode: latencyParams.scanMode, rounds: latencyParams.rounds } : {}),
         };
         try {
             if (kind === 'probe') {
                 const res = await probeSingle(base, req);
                 setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: undefined, probe: res } }));
+            } else if (kind === 'latency') {
+                const res = await latencySingle(base, req);
+                setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: undefined, latency: res } }));
+                if (res.ok && res.latency !== undefined) {
+                    latencyUpdates.current[key] = { latency: res.latency, latencies: res.latencies, lossPct: res.lossPct, jitterMs: res.jitterMs };
+                }
             } else {
                 const res = await speedSingle(base, req);
                 setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: undefined, speed: res } }));
@@ -136,7 +190,9 @@ export function SavedIpList() {
                     testing: undefined,
                     ...(kind === 'probe'
                         ? { probe: { ok: false, error: e instanceof Error ? e.message : '未知错误' } }
-                        : { speed: { ok: false, error: e instanceof Error ? e.message : '未知错误' } }),
+                        : kind === 'latency'
+                            ? { latency: { ok: false, error: e instanceof Error ? e.message : '未知错误' } }
+                            : { speed: { ok: false, error: e instanceof Error ? e.message : '未知错误' } }),
                 },
             }));
             return true;
@@ -144,7 +200,7 @@ export function SavedIpList() {
     };
 
     /** 一键批量测试：只测已勾选且当前可见的行，最多 4 个并发 */
-    const runBatch = async (kind: 'probe' | 'speed', targets: FlatIpItem[]) => {
+    const runBatch = async (kind: 'probe' | 'speed' | 'latency', targets: FlatIpItem[]) => {
         if (batchKind) return;
         if (targets.length === 0) {
             showToast('请先勾选要测试的 IP', 'warning');
@@ -153,6 +209,7 @@ export function SavedIpList() {
         const base = await getAgentBase();
         if (!base) return;
         if (await checkBusy(base)) return;
+        latencyUpdates.current = {};
         setBatchKind(kind);
         setBatchDone(0);
         setBatchTotal(targets.length);
@@ -180,6 +237,9 @@ export function SavedIpList() {
         }
         if (kind === 'probe') {
             showToast(`探针复检完成：共 ${targets.length} 个`, 'success');
+        } else if (kind === 'latency') {
+            const updated = await persistLatencyUpdates();
+            showToast(updated > 0 ? `测延迟完成：共 ${targets.length} 个，已更新 ${updated} 条延迟` : `测延迟完成：共 ${targets.length} 个，没有可更新的延迟`, updated > 0 ? 'success' : 'warning');
         } else {
             showToast(`测速完成：共 ${targets.length} 个`, 'success');
         }
@@ -252,7 +312,7 @@ export function SavedIpList() {
     });
 
     /** 批量测试的入口：从当前可见行里取已勾选的 */
-    const handleBatchClick = (kind: 'probe' | 'speed') => {
+    const handleBatchClick = (kind: 'probe' | 'speed' | 'latency') => {
         const targets = filteredItemsSorted.filter(item => selectedItems.has(itemKey(item)));
         if (targets.length === 0) {
             showToast('请先勾选要测试的 IP', 'warning');
@@ -578,11 +638,19 @@ export function SavedIpList() {
                             </button>
                             <button
                                 type="button"
+                                onClick={() => handleBatchClick('latency')}
+                                disabled={batchKind !== null}
+                                className="px-3 py-1 text-xs font-medium text-emerald-800 bg-emerald-100 rounded-full hover:bg-emerald-200 dark:bg-emerald-900 dark:text-emerald-300 dark:hover:bg-emerald-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                {batchKind === 'latency' ? `测延迟中 ${batchDone}/${batchTotal}…` : '一键测延迟'}
+                            </button>
+                            <button
+                                type="button"
                                 onClick={() => handleBatchClick('speed')}
                                 disabled={batchKind !== null}
                                 className="px-3 py-1 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                             >
-                                {batchKind === 'speed' ? `测速中 ${batchDone}/${batchTotal}…` : '一键测速'}
+                                {batchKind === 'speed' ? `下载测速中 ${batchDone}/${batchTotal}…` : '一键测下载速度'}
                             </button>
                             {selectedItems.size > 0 && (
                                 <button
@@ -663,12 +731,20 @@ export function SavedIpList() {
                                             return (
                                                 <div className="flex flex-col gap-1">
                                                     {t?.testing === 'probe' && <span className="text-teal-600">探针中…</span>}
-                                                    {t?.testing === 'speed' && <span className="text-blue-600">测速中…</span>}
+                                                    {t?.testing === 'latency' && <span className="text-emerald-600">测延迟中…</span>}
+                                                    {t?.testing === 'speed' && <span className="text-blue-600">下载测速中…</span>}
                                                     {t?.probe && (
                                                         <span className={t.probe.ok ? 'text-green-600' : 'text-red-600'}>
                                                             {t.probe.ok
                                                                 ? `通${t.probe.colo ? ` ${t.probe.colo}` : ''}${t.probe.latencyMs !== undefined ? ` ${t.probe.latencyMs}ms` : ''}`
                                                                 : '不通'}
+                                                        </span>
+                                                    )}
+                                                    {t?.latency && (
+                                                        <span className={t.latency.ok ? 'text-emerald-600' : 'text-red-600'}>
+                                                            {t.latency.ok && t.latency.latency !== undefined
+                                                                ? `延迟 ${t.latency.latency}ms`
+                                                                : '测延迟失败'}
                                                         </span>
                                                     )}
                                                     {t?.speed && (
