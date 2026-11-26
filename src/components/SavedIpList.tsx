@@ -43,6 +43,18 @@ export function SavedIpList() {
     const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
     /** 地区筛选：下拉选一个机房代码（NRT/HKG/ICN…），只看该地区的 IP；'all' 为全部 */
     const [selectedRegion, setSelectedRegion] = useState<string>('all');
+    /** 表头排序：点一下按该列升序，再点一下降序；默认按延迟升序（和原来一致） */
+    type SortKey = 'ip' | 'port' | 'latency' | 'lossPct' | 'jitterMs' | 'colo' | 'scene';
+    const [sortKey, setSortKey] = useState<SortKey>('latency');
+    const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
+    const toggleSort = (key: SortKey) => {
+        if (sortKey === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+        else {
+            setSortKey(key);
+            setSortDir('asc');
+        }
+    };
+    const sortArrow = (key: SortKey) => (sortKey === key ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '');
     /** 延迟上限筛选：只显示延迟 ≤ 该值的 IP（高于该值的不显示）；留空为不过滤，值记在浏览器里 */
     const [latencyMax, setLatencyMax] = useState<string>(() => {
         try { return localStorage.getItem('CF_SAVED_LATENCY_MAX') || ''; } catch { return ''; }
@@ -99,6 +111,22 @@ export function SavedIpList() {
             // 查不到就交给后端 409 判断
         }
         return false;
+    };
+
+    /** 旧版本地后端没有 /latency、/speed、/probe 接口：先用一个空请求探一下，
+     *  404 就直接提示重编重启，别让整批几十个全报失败还看不出原因。
+     *  接口存在时空请求只会回 400（缺 IP/端口），不算失败。 */
+    const checkEndpoint = async (base: string, path: '/latency' | '/speed' | '/probe'): Promise<boolean> => {
+        try {
+            const res = await fetch(`${base}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+            if (res.status === 404) {
+                showToast('本地后端太旧，没有这个接口：请先覆盖 main.go、跑 build.bat 重编、再重启 exe', 'error');
+                return false;
+            }
+            return true;
+        } catch {
+            return true;
+        }
     };
 
     const readProbeHost = (): string => {
@@ -209,6 +237,7 @@ export function SavedIpList() {
         const base = await getAgentBase();
         if (!base) return;
         if (await checkBusy(base)) return;
+        if (!(await checkEndpoint(base, kind === 'probe' ? '/probe' : kind === 'latency' ? '/latency' : '/speed'))) return;
         latencyUpdates.current = {};
         setBatchKind(kind);
         setBatchDone(0);
@@ -307,8 +336,25 @@ export function SavedIpList() {
         ? filteredBySceneRegion
         : filteredBySceneRegion.filter(i => i.latency >= 0 && i.latency <= latencyMaxNum);
     const latencyHiddenCount = filteredBySceneRegion.length - filteredItems.length;
+    /** 表头排序：没数据的（丢包/抖动留空）永远排最后，不参与方向翻转 */
+    const cmpOptNum = (a?: number, b?: number) => {
+        if (a === undefined && b === undefined) return 0;
+        if (a === undefined) return 1;
+        if (b === undefined) return -1;
+        return a - b;
+    };
     const filteredItemsSorted = [...filteredItems].sort((a, b) => {
-        return a.latency - b.latency;
+        const dir = sortDir === 'asc' ? 1 : -1;
+        switch (sortKey) {
+            case 'ip': return dir * a.ip.localeCompare(b.ip);
+            case 'port': return dir * (a.port - b.port);
+            case 'latency': return dir * (a.latency - b.latency);
+            case 'lossPct': return dir * cmpOptNum(a.lossPct, b.lossPct);
+            case 'jitterMs': return dir * cmpOptNum(a.jitterMs, b.jitterMs);
+            case 'colo': return dir * (a.colo || '').localeCompare(b.colo || '');
+            case 'scene': return dir * a.sceneName.localeCompare(b.sceneName);
+            default: return 0;
+        }
     });
 
     /** 批量测试的入口：从当前可见行里取已勾选的 */
@@ -683,15 +729,41 @@ export function SavedIpList() {
                                     className="rounded text-purple-600 focus:ring-purple-500 h-4 w-4"
                                 />
                             </th>
-                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">IP/域名</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                                <button type="button" onClick={() => toggleSort('ip')} className="hover:text-gray-800 dark:hover:text-white" title="按 IP/域名排序">IP/域名{sortArrow('ip')}</button>
+                            </th>
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">来源</th>
-                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">端口</th>
-                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">延迟</th>
-                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">丢包</th>
-                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">抖动</th>
-                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">地区代码</th>
-                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">地区</th>
-                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">场景</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                                <button type="button" onClick={() => toggleSort('port')} className="hover:text-gray-800 dark:hover:text-white" title="按端口排序">端口{sortArrow('port')}</button>
+                            </th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                                <button type="button" onClick={() => toggleSort('latency')} className="hover:text-gray-800 dark:hover:text-white" title="按延迟排序">延迟{sortArrow('latency')}</button>
+                            </th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                                <button type="button" onClick={() => toggleSort('lossPct')} className="hover:text-gray-800 dark:hover:text-white" title="按丢包排序">丢包{sortArrow('lossPct')}</button>
+                            </th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                                <button type="button" onClick={() => toggleSort('jitterMs')} className="hover:text-gray-800 dark:hover:text-white" title="按抖动排序">抖动{sortArrow('jitterMs')}</button>
+                            </th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                                <button type="button" onClick={() => toggleSort('colo')} className="hover:text-gray-800 dark:hover:text-white" title="按地区代码排序">地区代码{sortArrow('colo')}</button>
+                            </th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                                <select
+                                    value={effectiveRegion}
+                                    onChange={(e) => setSelectedRegion(e.target.value)}
+                                    className="px-2 py-1 text-xs font-medium normal-case text-gray-700 bg-white border border-gray-200 rounded-full hover:border-gray-300 dark:bg-gray-800 dark:text-gray-200 dark:border-gray-600 outline-none cursor-pointer"
+                                    title="按地区筛选（和上面筛选栏联动）"
+                                >
+                                    <option value="all">地区：全部</option>
+                                    {regionOptions.map(({ colo, count }) => (
+                                        <option key={colo} value={colo}>{colo} · {getColoName(colo)}（{count} 个）</option>
+                                    ))}
+                                </select>
+                            </th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                                <button type="button" onClick={() => toggleSort('scene')} className="hover:text-gray-800 dark:hover:text-white" title="按场景排序">场景{sortArrow('scene')}</button>
+                            </th>
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">复检结果</th>
                         </tr>
                     </thead>
@@ -744,7 +816,7 @@ export function SavedIpList() {
                                                         <span className={t.latency.ok ? 'text-emerald-600' : 'text-red-600'}>
                                                             {t.latency.ok && t.latency.latency !== undefined
                                                                 ? `延迟 ${t.latency.latency}ms`
-                                                                : '测延迟失败'}
+                                                                : `测延迟失败${t.latency.error ? `（${t.latency.error}）` : ''}`}
                                                         </span>
                                                     )}
                                                     {t?.speed && (

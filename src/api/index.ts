@@ -151,6 +151,20 @@ export async function login(password: string): Promise<{ success: boolean; messa
     }
 }
 
+/** 裂变订阅链接：把一份订阅快照存到后端 KV，返回可拉取的链接路径（/api/sub?id=xxx）。
+ *  生成要登录（后端 POST 要鉴权），拉取公开（客户端没有 token 也能拉）。 */
+export async function createSubLink(
+    format: 'v2ray' | 'clash' | 'singbox',
+    content: string,
+): Promise<{ id: string; url: string }> {
+    const response = await authedFetch('/api/sub', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ format, content }),
+    });
+    return handleResponse<{ id: string; url: string }>(response);
+}
+
 export async function getThirdPartySources(): Promise<string[]> {
     // 添加时间戳防止缓存
     return handleResponse<string[]>(await authedFetch(`/api/sources?t=${Date.now()}`));

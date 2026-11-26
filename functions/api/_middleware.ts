@@ -14,6 +14,13 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         return await next();
     }
 
+    // 公共接口：订阅拉取不需要鉴权——客户端（V2RayN / 小火箭 / Clash）
+    // 没有本站的登录 token，GET /api/sub?id=xxx 必须能直接拉到内容；
+    // 生成链接的 POST 仍要鉴权（下面继续检查）。
+    if (url.pathname === '/api/sub' && request.method === 'GET') {
+        return await next();
+    }
+
     // 受保护的接口：检查 Authorization Header
     const authHeader = request.headers.get('Authorization');
     if (!authHeader || !authHeader.startsWith('Bearer ')) {

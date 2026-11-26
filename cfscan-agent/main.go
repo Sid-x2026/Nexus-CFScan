@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version     = "0.1.0"
+	version     = "0.2.0" // 0.2.0 起带 POST /probe、/speed、/latency；旧版没有这三个接口
 	serviceName = "nexus-cfscan-agent"
 	basePort    = 13335
 	maxPortTry  = 10

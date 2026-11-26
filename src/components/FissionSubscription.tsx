@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { getScenes, getSceneResults } from '../api';
+import { getScenes, getSceneResults, createSubLink } from '../api';
 import { ScanResult } from '../utils/scanner';
 import { getColoName } from '../utils/colo';
 import { useToast } from './Toast';
@@ -9,7 +9,7 @@ import {
     type FissionAddr, type FissionResult,
 } from '../utils/fission';
 import QRCode from 'qrcode';
-import { Split, Copy, Download, Zap, QrCode, X } from 'lucide-react';
+import { Split, Copy, Download, Zap, QrCode, X, Link2 } from 'lucide-react';
 
 const NATIVE_KEY = 'CF_FISSION_NATIVE';
 const SCENE_KEY = 'CF_FISSION_SCENE';
@@ -62,6 +62,10 @@ export function FissionSubscription() {
     const [qrTarget, setQrTarget] = useState<{ label: string; content: string } | null>(null);
     const [qrUrl, setQrUrl] = useState('');
     const [qrErr, setQrErr] = useState('');
+    // 每行生成的订阅链接（按 V2Ray / Shadowrocket / Clash / sing-box 存）：
+    // 存的是生成那一刻的快照，裂变后改了节点名，链接还是旧的，得重新生成
+    const [subLinks, setSubLinks] = useState<Record<string, string>>({});
+    const [generatingLink, setGeneratingLink] = useState<string | null>(null);
 
     const itemKey = (r: ScanResult) => `${r.ip}:${r.port}`;
     const sortedItems = useMemo(
@@ -106,6 +110,7 @@ export function FissionSubscription() {
         setScene(name);
         saveStored(SCENE_KEY, name);
         setResult(null);
+        setSubLinks({});
         void loadSceneItems(name);
     };
 
@@ -127,8 +132,9 @@ export function FissionSubscription() {
         return sortedItems
             .filter((r) => checked.has(itemKey(r)))
             .map((r) => ({
-                // 域名源用解析出的实际 IP，其余用 IP 本身
-                addr: r.resolvedIp || r.ip,
+                // 域名源用解析出的实际 IP，其余用 IP 本身；端口直接用保存的端口，
+                // 裂变时连端口一起换，不用再手动改
+                addr: (r.resolvedIp || r.ip) + (r.port ? `:${r.port}` : ''),
             }));
     }, [source, customParsed, sortedItems, checked]);
 
@@ -187,11 +193,13 @@ export function FissionSubscription() {
         const prefix = [namePrefix.trim(), nameRegion.trim()].filter(Boolean).join('|') || undefined;
         const r = fissionLinks(nativeLinks, selectedAddrs, mode, prefix);
         setResult(r);
+        setSubLinks({});
         showToast(`裂变完成：${r.argoCount} 条隧道协议 × ${r.addrCount} 个优选地址，共 ${r.links.length} 条节点`, 'success');
     };
 
-    /** 裂变后改某条节点的名称（只改备注，订阅跟着变） */
+    /** 裂变后改某条节点的名称（只改备注，订阅跟着变；已生成的链接是旧快照，作废重生成） */
     const handleRename = (index: number, newName: string) => {
+        setSubLinks({});
         setResult((prev) => {
             if (!prev) return prev;
             return {
@@ -199,6 +207,28 @@ export function FissionSubscription() {
                 links: prev.links.map((l, j) => (j === index ? renameLinkName(l, newName) : l)),
             };
         });
+    };
+
+    /** 生成可拉取的订阅链接：把这行订阅的快照存到后端 KV，返回一条 https 链接；
+     *  Shadowrocket 和 V2Ray 是同一份内容，都按 v2ray 格式存。二维码扫的就是这条链接。 */
+    const handleGenLink = async (row: { key: string; label: string; content: string }) => {
+        if (!row.content) {
+            showToast('暂无可生成的内容', 'warning');
+            return;
+        }
+        const format = row.key === 'clash' ? 'clash' : row.key === 'singbox' ? 'singbox' : 'v2ray';
+        setGeneratingLink(row.key);
+        try {
+            const { url } = await createSubLink(format, row.content);
+            const abs = `${window.location.origin}${url}`;
+            setSubLinks((prev) => ({ ...prev, [row.key]: abs }));
+            showToast(`${row.label}订阅链接已生成`, 'success');
+        } catch (e) {
+            console.error('Failed to create subscription link', e);
+            showToast(`生成链接失败：${e instanceof Error ? e.message : '未知错误'}`, 'error');
+        } finally {
+            setGeneratingLink(null);
+        }
     };
 
     const subOutputs = useMemo(() => {
@@ -453,7 +483,7 @@ export function FissionSubscription() {
                 className="w-full p-3 border rounded-md font-mono text-sm dark:bg-gray-600 dark:border-gray-500 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none mb-2"
             />
             <p className="text-xs text-gray-500 dark:text-gray-400 mb-6">
-                两种给法都行：上面填订阅链接点拉取，或下面直接粘贴节点。只存在浏览器本地，下次打开不用再贴。节点名称只按命名规则来：前缀|地区|原协议名称，不再追加机房、延迟。场景模式的端口沿用原生链接的端口。
+                两种给法都行：上面填订阅链接点拉取，或下面直接粘贴节点。只存在浏览器本地，下次打开不用再贴。节点名称只按命名规则来：前缀|地区|原协议名称，不再追加机房、延迟。场景模式用每个 IP 保存的端口，自定义输入里写了端口的也按写的来。
             </p>
 
             {/* ③ 分配方式 + 节点命名 */}
@@ -565,49 +595,83 @@ export function FissionSubscription() {
                     <h3 className="text-lg font-semibold text-gray-700 dark:text-gray-200 mb-3">④ 一键生成订阅</h3>
                     <div className="border border-gray-200 dark:border-gray-600 rounded-lg divide-y divide-gray-200 dark:divide-gray-700 mb-2">
                         {subRows.map((row) => (
-                            <div key={row.key} className="flex items-center gap-2 px-3 py-2.5">
-                                <div className="w-24 shrink-0">
-                                    <p className="text-sm font-medium text-gray-800 dark:text-gray-100">{row.label}</p>
-                                    <p className="text-xs text-gray-400 dark:text-gray-500 leading-tight">{row.desc}</p>
+                            <div key={row.key} className="px-3 py-2.5">
+                                <div className="flex items-center gap-2">
+                                    <div className="w-24 shrink-0">
+                                        <p className="text-sm font-medium text-gray-800 dark:text-gray-100">{row.label}</p>
+                                        <p className="text-xs text-gray-400 dark:text-gray-500 leading-tight">{row.desc}</p>
+                                    </div>
+                                    <input
+                                        type="text"
+                                        readOnly
+                                        value={row.content}
+                                        onFocus={(e) => e.target.select()}
+                                        className="flex-1 min-w-0 p-2 border rounded-md font-mono text-xs bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-200 outline-none"
+                                    />
+                                    <button
+                                        type="button"
+                                        disabled={!row.content}
+                                        onClick={() => void copyText(row.content, `${row.label}订阅已复制`)}
+                                        className="shrink-0 flex items-center px-3 py-2 text-sm font-medium text-blue-800 bg-blue-100 rounded-md hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                    >
+                                        <Copy className="w-4 h-4 mr-1" /> 复制
+                                    </button>
+                                    <button
+                                        type="button"
+                                        disabled={!row.content || generatingLink === row.key}
+                                        onClick={() => void handleGenLink(row)}
+                                        title="生成一条可拉取的 https 订阅链接"
+                                        className="shrink-0 flex items-center px-3 py-2 text-sm font-medium text-green-800 bg-green-100 rounded-md hover:bg-green-200 dark:bg-green-900 dark:text-green-300 dark:hover:bg-green-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                    >
+                                        <Link2 className="w-4 h-4 mr-1" /> {generatingLink === row.key ? '生成中…' : '生成链接'}
+                                    </button>
+                                    <button
+                                        type="button"
+                                        disabled={!row.content}
+                                        onClick={() => {
+                                            const link = subLinks[row.key];
+                                            if (link) void openQr(row.label, link);
+                                            else showToast('请先点「生成链接」，二维码扫的是订阅链接', 'warning');
+                                        }}
+                                        title="先生成订阅链接，再扫码导入"
+                                        className="shrink-0 flex items-center px-3 py-2 text-sm font-medium text-purple-800 bg-purple-100 rounded-md hover:bg-purple-200 dark:bg-purple-900 dark:text-purple-300 dark:hover:bg-purple-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                    >
+                                        <QrCode className="w-4 h-4 mr-1" /> 二维码
+                                    </button>
+                                    <button
+                                        type="button"
+                                        disabled={!row.content}
+                                        onClick={() => downloadFile(row.file, row.content)}
+                                        title="下载订阅文件"
+                                        className="shrink-0 flex items-center px-3 py-2 text-sm font-medium text-gray-800 bg-gray-100 rounded-md hover:bg-gray-200 dark:bg-gray-600 dark:text-gray-300 dark:hover:bg-gray-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                    >
+                                        <Download className="w-4 h-4" />
+                                    </button>
                                 </div>
-                                <input
-                                    type="text"
-                                    readOnly
-                                    value={row.content}
-                                    onFocus={(e) => e.target.select()}
-                                    className="flex-1 min-w-0 p-2 border rounded-md font-mono text-xs bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-200 outline-none"
-                                />
-                                <button
-                                    type="button"
-                                    disabled={!row.content}
-                                    onClick={() => void copyText(row.content, `${row.label}订阅已复制`)}
-                                    className="shrink-0 flex items-center px-3 py-2 text-sm font-medium text-blue-800 bg-blue-100 rounded-md hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                >
-                                    <Copy className="w-4 h-4 mr-1" /> 复制
-                                </button>
-                                <button
-                                    type="button"
-                                    disabled={!row.content}
-                                    onClick={() => void openQr(row.label, row.content)}
-                                    title="显示二维码，打开客户端扫码导入"
-                                    className="shrink-0 flex items-center px-3 py-2 text-sm font-medium text-purple-800 bg-purple-100 rounded-md hover:bg-purple-200 dark:bg-purple-900 dark:text-purple-300 dark:hover:bg-purple-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                >
-                                    <QrCode className="w-4 h-4 mr-1" /> 二维码
-                                </button>
-                                <button
-                                    type="button"
-                                    disabled={!row.content}
-                                    onClick={() => downloadFile(row.file, row.content)}
-                                    title="下载订阅文件"
-                                    className="shrink-0 flex items-center px-3 py-2 text-sm font-medium text-gray-800 bg-gray-100 rounded-md hover:bg-gray-200 dark:bg-gray-600 dark:text-gray-300 dark:hover:bg-gray-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                                >
-                                    <Download className="w-4 h-4" />
-                                </button>
+                                {subLinks[row.key] && (
+                                    <div className="flex items-center gap-2 mt-2">
+                                        <span className="text-xs text-gray-500 dark:text-gray-400 shrink-0">订阅链接</span>
+                                        <input
+                                            type="text"
+                                            readOnly
+                                            value={subLinks[row.key]}
+                                            onFocus={(e) => e.target.select()}
+                                            className="flex-1 min-w-0 p-1.5 border rounded-md font-mono text-xs bg-green-50 dark:bg-green-900/20 dark:border-gray-600 dark:text-gray-200 outline-none"
+                                        />
+                                        <button
+                                            type="button"
+                                            onClick={() => void copyText(subLinks[row.key], `${row.label}订阅链接已复制`)}
+                                            className="shrink-0 flex items-center px-3 py-1.5 text-sm font-medium text-green-800 bg-green-100 rounded-md hover:bg-green-200 dark:bg-green-900 dark:text-green-300 dark:hover:bg-green-800 transition-colors"
+                                        >
+                                            <Copy className="w-4 h-4 mr-1" /> 复制链接
+                                        </button>
+                                    </div>
+                                )}
                             </div>
                         ))}
                     </div>
                     <p className="text-xs text-gray-500 dark:text-gray-400">
-                        点「二维码」会弹出大图，打开客户端扫码导入。内容太长（二位码放不下约 3KB）时会提示，节点太多就减少勾选后重新裂变，或直接用复制。
+                        点「生成链接」会把这份订阅存一份，生成一条 https 订阅链接，直接填进客户端的订阅地址栏就能拉取；「二维码」扫的就是这条链接。改了节点名后链接还是旧快照，重新生成一条新的。订阅内容本身也可以直接复制导入，不用链接也行。
                     </p>
                 </>
             )}
