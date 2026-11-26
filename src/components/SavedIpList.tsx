@@ -751,7 +751,7 @@ export function SavedIpList() {
                                                         <span className={t.speed.ok ? 'text-blue-600' : 'text-red-600'}>
                                                             {t.speed.ok && t.speed.speedMbps !== undefined
                                                                 ? `${t.speed.speedMbps.toFixed(1)} MB/s`
-                                                                : '测速失败'}
+                                                                : `测速失败${t.speed.error ? `（${t.speed.error}）` : ''}`}
                                                         </span>
                                                     )}
                                                 </div>

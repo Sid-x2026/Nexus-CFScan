@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -693,8 +694,11 @@ func handleLatency(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSpeed: POST /speed — single IP/port download speed test.
-// Downloads via ip:port with SNI = probeHost (or speed.cloudflare.com),
-// capped at ~10 MB or ~8 s, whichever comes first.
+// Downloads via ip:port with SNI = the speed URL's own host
+// (speed.cloudflare.com), capped at ~10 MB or ~8 s, whichever comes first.
+// NOTE: never use probeHost as SNI here — the speed file lives on
+// speed.cloudflare.com, and a node domain as SNI routes the request to
+// the node (or fails the handshake), so every test fails.
 func handleSpeed(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "method not allowed"})
@@ -726,7 +730,13 @@ func handleSpeed(w http.ResponseWriter, r *http.Request) {
 	if req.TimeoutMs > 0 && time.Duration(req.TimeoutMs)*time.Millisecond < dialTimeout {
 		dialTimeout = time.Duration(req.TimeoutMs) * time.Millisecond
 	}
-	sni := probeSNI(req.ProbeHost)
+	// SNI 必须用测速地址自己的域名：文件在 speed.cloudflare.com 上，
+	// 拿探针域名（节点域名）当 SNI 会把请求指到节点那边去，文件不存在，全都失败。
+	speedHost := "speed.cloudflare.com"
+	if u, err := url.Parse(speedURL); err == nil && u.Hostname() != "" {
+		speedHost = u.Hostname()
+	}
+	sni := speedHost
 	useTLS := strings.HasPrefix(strings.ToLower(speedURL), "https://")
 	dialer := &net.Dialer{Timeout: dialTimeout}
 	transport := &http.Transport{

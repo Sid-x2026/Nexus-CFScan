@@ -37,7 +37,7 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
     const [selectedSources, setSelectedSources] = useState<Set<SourceKind>>(new Set());
     const filterInitialized = useRef(false);
 
-    // ---------- 批量按需测试（勾选 + 右上角一键探针复检 / 一键测速） ----------
+    // ---------- 批量按需测试（勾选 + 右上角一键探针复检 / 一键测下载速度） ----------
     interface RowTest {
         probe?: SingleProbeResult;
         speed?: SingleSpeedResult;
@@ -424,7 +424,7 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                                     disabled={batchKind !== null}
                                     className="px-3 py-1 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
-                                    {batchKind === 'speed' ? `测速中 ${batchDone}/${batchTotal}…` : '一键测速'}
+                                    {batchKind === 'speed' ? `下载测速中 ${batchDone}/${batchTotal}…` : '一键测下载速度'}
                                 </button>
                             </div>
                         </div>
@@ -621,7 +621,7 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
                                         <div className="flex flex-col gap-1">
                                             {t?.testing === 'probe' && <span className="text-teal-600">探针中…</span>}
-                                            {t?.testing === 'speed' && <span className="text-blue-600">测速中…</span>}
+                                            {t?.testing === 'speed' && <span className="text-blue-600">下载测速中…</span>}
                                             {t?.probe && (
                                                 <span className={t.probe.ok ? 'text-green-600' : 'text-red-600'}>
                                                     {t.probe.ok
@@ -633,7 +633,7 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                                                 <span className={t.speed.ok ? 'text-blue-600' : 'text-red-600'}>
                                                     {t.speed.ok && t.speed.speedMbps !== undefined
                                                         ? `${t.speed.speedMbps.toFixed(1)} MB/s`
-                                                        : '测速失败'}
+                                                        : `测速失败${t.speed.error ? `（${t.speed.error}）` : ''}`}
                                                 </span>
                                             )}
                                         </div>
