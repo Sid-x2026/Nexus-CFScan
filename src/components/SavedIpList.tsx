@@ -40,6 +40,10 @@ export function SavedIpList() {
     const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
     /** 地区筛选：下拉选一个机房代码（NRT/HKG/ICN…），只看该地区的 IP；'all' 为全部 */
     const [selectedRegion, setSelectedRegion] = useState<string>('all');
+    /** 延迟上限筛选：只显示延迟 ≤ 该值的 IP（高于该值的不显示）；留空为不过滤，值记在浏览器里 */
+    const [latencyMax, setLatencyMax] = useState<string>(() => {
+        try { return localStorage.getItem('CF_SAVED_LATENCY_MAX') || ''; } catch { return ''; }
+    });
     // 已保存列表平时不常翻，支持收起；状态记在浏览器里，默认展开
     const [collapsed, setCollapsed] = useState(() => {
         try { return localStorage.getItem('CF_SAVED_LIST_COLLAPSED') === '1'; } catch { return false; }
@@ -233,10 +237,16 @@ export function SavedIpList() {
     }, [items]);
     // 选中的地区已被删空时自动回到全部
     const effectiveRegion = regionOptions.some(r => r.colo === selectedRegion) ? selectedRegion : 'all';
-    const filteredItems = items.filter(i =>
+    const latencyMaxNum = /^\d+$/.test(latencyMax.trim()) ? parseInt(latencyMax.trim(), 10) : null;
+    const filteredBySceneRegion = items.filter(i =>
         selectedScenes.has(i.sceneName) &&
         (effectiveRegion === 'all' || i.colo === effectiveRegion)
     );
+    /** 延迟上限：只留延迟 ≤ 上限的；延迟 -1（无数据）的不算达标，也隐藏 */
+    const filteredItems = latencyMaxNum === null
+        ? filteredBySceneRegion
+        : filteredBySceneRegion.filter(i => i.latency >= 0 && i.latency <= latencyMaxNum);
+    const latencyHiddenCount = filteredBySceneRegion.length - filteredItems.length;
     const filteredItemsSorted = [...filteredItems].sort((a, b) => {
         return a.latency - b.latency;
     });
@@ -520,6 +530,25 @@ export function SavedIpList() {
                                 <option key={colo} value={colo}>{colo} · {getColoName(colo)}（{count} 个）</option>
                             ))}
                         </select>
+                        <span className="flex items-center gap-1 text-xs font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap ml-2" title="只显示延迟不超过该值的 IP，高于该值的不显示；留空为全部显示">
+                            延迟 ≤
+                            <input
+                                type="text"
+                                inputMode="numeric"
+                                value={latencyMax}
+                                placeholder="不限"
+                                onChange={(e) => {
+                                    const v = e.target.value.replace(/[^\d]/g, '').slice(0, 5);
+                                    setLatencyMax(v);
+                                    try { localStorage.setItem('CF_SAVED_LATENCY_MAX', v); } catch { /* 忽略 */ }
+                                }}
+                                className="w-16 px-2 py-1 text-xs font-medium text-gray-700 bg-white border border-gray-200 rounded-full text-center dark:bg-gray-800 dark:text-gray-200 dark:border-gray-600 outline-none focus:border-indigo-400"
+                            />
+                            ms
+                            {latencyMaxNum !== null && latencyHiddenCount > 0 && (
+                                <span className="text-gray-400 dark:text-gray-500 font-normal">已隐藏 {latencyHiddenCount} 个</span>
+                            )}
+                        </span>
                         {/* 操作按使用顺序排：先选场景，再勾行测，最后删、刷新 */}
                         <div className="flex flex-wrap items-center gap-2 ml-auto">
                             <button
