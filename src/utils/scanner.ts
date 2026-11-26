@@ -250,6 +250,79 @@ export function generateRandomIps(cidrs: string[], count: number): string[] {
     return Array.from(randomIps);
 }
 
+/** 单次扫描最多生成的目标数：段太大时全扫不现实，改随机抽这么多个 */
+export const MAX_SCAN_TARGETS = 20000;
+
+/** 单个 CIDR 包含的 IP 总数：2^(32-prefix) */
+export function cidrSize(cidr: string): number {
+    const parts = cidr.split('/');
+    if (parts.length !== 2) return 0;
+    const prefix = parseInt(parts[1], 10);
+    if (isNaN(prefix) || prefix < 0 || prefix > 32) return 0;
+    return 2 ** (32 - prefix);
+}
+
+/** 一组 CIDR 的 IP 总数 */
+export function totalIps(cidrs: string[]): number {
+    return cidrs.reduce((sum, c) => sum + cidrSize(c), 0);
+}
+
+/** IP 总数显示：过万用「万」，以下千分位 */
+export function formatIpCount(n: number): string {
+    if (n >= 10000) {
+        const w = (n / 10000).toFixed(1).replace(/\.0$/, '');
+        return `${w} 万`;
+    }
+    return n.toLocaleString('en-US');
+}
+
+/** 按顺序枚举一个 CIDR 里的全部 IP（不含广播/网络地址区分，全段都扫） */
+function enumerateIpsFromCIDR(cidr: string): string[] {
+    const [baseIP, prefixLength] = cidr.split('/');
+    const prefix = parseInt(prefixLength, 10);
+    if (prefix === 32) return [baseIP];
+    const hostBits = 32 - prefix;
+    const total = 2 ** hostBits;
+    const ipParts = baseIP.split('.').map(p => parseInt(p, 10));
+    const ipInt = (ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3];
+    const mask = (0xFFFFFFFF << hostBits) >>> 0;
+    const base = (ipInt & mask) >>> 0;
+    const out: string[] = [];
+    for (let i = 0; i < total; i++) {
+        const v = (base + i) >>> 0;
+        out.push([(v >>> 24) & 0xFF, (v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF].join('.'));
+    }
+    return out;
+}
+
+/**
+ * 按 SHU 的规则生成本次扫描目标：
+ * 随机数 ≥ 选中段的 IP 总数 → 全扫（按顺序枚举，不重不漏）；
+ * 随机数 < 总数 → 随机抽指定个数。
+ * 段太大（总数超过单次上限）时全扫不现实，改为随机抽上限个数。
+ */
+export function generateIps(cidrs: string[], count: number): string[] {
+    if (!cidrs || cidrs.length === 0) {
+        return [];
+    }
+    const total = totalIps(cidrs);
+    if (count >= total && total <= MAX_SCAN_TARGETS) {
+        const all: string[] = [];
+        for (const cidr of cidrs) all.push(...enumerateIpsFromCIDR(cidr));
+        return all;
+    }
+    return generateRandomIps(cidrs, Math.min(count, MAX_SCAN_TARGETS));
+}
+
+/** 生成计划：供界面提前显示「本次全扫 / 随机抽几个」 */
+export function planIpGeneration(cidrs: string[], count: number): { mode: 'all' | 'random'; total: number; planned: number } {
+    const total = totalIps(cidrs);
+    if (count >= total && total <= MAX_SCAN_TARGETS) {
+        return { mode: 'all', total, planned: total };
+    }
+    return { mode: 'random', total, planned: Math.min(count, MAX_SCAN_TARGETS) };
+}
+
 // =================================================================
 // 3. 其他工具函数
 // =================================================================

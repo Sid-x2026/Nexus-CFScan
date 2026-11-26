@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { CloudflareIps, getThirdPartySourceList, getThirdPartySourceIps } from '../api';
 
 type SourceRowStatus = 'pending' | 'loading' | 'done' | 'error';
@@ -11,7 +11,10 @@ interface SourceRow {
     ips?: { ip: string; port: number }[];
 }
 import {
-    generateRandomIps,
+    generateIps,
+    planIpGeneration,
+    formatIpCount,
+    MAX_SCAN_TARGETS,
     ScanResult,
     CF_CIDR_LIST,
     isDomainName,
@@ -39,6 +42,8 @@ import { useConfirm } from './ConfirmDialog';
 interface IpScannerConfigAndControlProps {
     cfIps: CloudflareIps | null;
     onScanComplete: (results: ScanResult[]) => void;
+    /** null = 扫全部段（默认）；数组 = 只扫段库里选中的段 */
+    selectedCidrs: string[] | null;
 }
 
 /** 扫描参数持久化：localStorage，下次打开自动沿用 */
@@ -63,7 +68,7 @@ function loadSavedParams() {
     }
 }
 
-export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndControlProps) {
+export function ScannerConfig({ cfIps, selectedCidrs, onScanComplete }: IpScannerConfigAndControlProps) {
     const saved = loadSavedParams();
     // ---------- 扫描参数（全部可自定义，改动即保存，下次沿用） ----------
     const [count, setCount] = useState<string>(String(saved.count));
@@ -101,6 +106,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
     // 端口选择框的值：'random' 或端口号字符串
     const portSelectValue = portMode === 'random' ? 'random' : String(selectedPort);
 
+
     // 参数变动即保存
     useEffect(() => {
         const params = {
@@ -121,6 +127,22 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
     }, [count, threads, latencyLimit, lossLimit, rounds, jitterStable, jitterBackup, timeoutMs, topN, speedUrl, scanMode, coloFilter]);
 
     const [ipSource, setIpSource] = useState<SourceKind>('cf');
+
+    /** 段库选段后的实时提示：本次全扫还是随机抽几个 */
+    const segPlanText = useMemo(() => {
+        if (ipSource !== 'cf' && ipSource !== 'cm') return '';
+        if (selectedCidrs === null) return '';
+        const sourceCidrs = ipSource === 'cf'
+            ? (cfIps?.ipv4_cidrs ?? [])
+            : (cfIps?.cm_cidrs ?? []);
+        const picked = sourceCidrs.filter(c => selectedCidrs.includes(c));
+        if (picked.length === 0) return '当前来源里没有选中的段，开始扫描会提示。';
+        const countNum = parseInt(count, 10);
+        if (isNaN(countNum)) return '';
+        const plan = planIpGeneration(picked, countNum);
+        if (plan.mode === 'all') return `已选 ${picked.length} 段，共 ${formatIpCount(plan.total)} 个 IP，随机数 ≥ 总数，本次全扫。`;
+        return `已选 ${picked.length} 段，共 ${formatIpCount(plan.total)} 个 IP，本次随机抽 ${plan.planned.toLocaleString('en-US')} 个。`;
+    }, [cfIps, ipSource, selectedCidrs, count]);
     // 测速配置平时不常改，支持收起；状态记在浏览器里，默认展开
     const [collapsed, setCollapsed] = useState(() => {
         try { return localStorage.getItem('CF_SCAN_CONFIG_COLLAPSED') === '1'; } catch { return false; }
@@ -409,15 +431,28 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             return { targets, resolvedMap, sourceMap };
         }
 
-        const cidrsToUse = ipSource === 'cf'
+        const sourceCidrs = ipSource === 'cf'
             ? (cfIps?.ipv4_cidrs?.length ? cfIps.ipv4_cidrs : (CF_CIDR_LIST || []))
             : (cfIps?.cm_cidrs?.length ? cfIps.cm_cidrs : (CF_CIDR_LIST || []));
 
-        if (!cidrsToUse || cidrsToUse.length === 0) {
+        if (!sourceCidrs || sourceCidrs.length === 0) {
             showToast('未找到Cloudflare IP段数据，请先点击上方的"同步IP段"按钮进行同步。', 'error');
             return null;
         }
-        const targets = generateRandomIps(cidrsToUse, countNum);
+        // 段库里选了段：只扫选中段；当前来源里一段没选则提示
+        let cidrsToUse = sourceCidrs;
+        if (selectedCidrs !== null) {
+            cidrsToUse = sourceCidrs.filter(c => selectedCidrs.includes(c));
+            if (cidrsToUse.length === 0) {
+                showToast('当前来源里没有选中的段，请先在上方 IP 段库里选一段，或点「全选」恢复', 'error');
+                return null;
+            }
+        }
+        const plan = planIpGeneration(cidrsToUse, countNum);
+        if (plan.mode === 'random' && countNum >= plan.total) {
+            showToast(`所选段共 ${formatIpCount(plan.total)} 个 IP，超过单次上限 ${MAX_SCAN_TARGETS.toLocaleString('en-US')}，已随机抽 ${plan.planned.toLocaleString('en-US')} 个`, 'warning');
+        }
+        const targets = generateIps(cidrsToUse, countNum);
         const sourceLabel = ipSource === 'cf' ? 'CF官方IP段' : 'CM整理IP段';
         const sourceMap: Record<string, string> = {};
         for (const t of targets) sourceMap[t] = sourceLabel;
@@ -785,6 +820,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                         disabled={isScanning || isPreparing || ipSource === 'third' || ipSource === 'domain'}
                     />
                     {countError && <p className="text-red-500 text-xs mt-1">{countError}</p>}
+                    {segPlanText && <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">{segPlanText}</p>}
                 </div>
                 <div>
                     <label htmlFor="port-select" className="block text-gray-700 dark:text-gray-300 text-sm font-semibold mb-1">端口:</label>

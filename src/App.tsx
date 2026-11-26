@@ -11,9 +11,39 @@ import { ScanResult } from './utils/scanner'; import { ScannerResults } from './
 function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [cfIps, setCfIps] = useState<CloudflareIps | null>(null);
+  /** IP 段库选段：null = 全部段（默认，老行为）；数组 = 只扫选中段 */
+  const [selectedCidrs, setSelectedCidrs] = useState<string[] | null>(() => {
+    try {
+      const raw = localStorage.getItem('CF_SELECTED_CIDRS');
+      return raw ? (JSON.parse(raw) as string[]) : null;
+    } catch { return null; }
+  });
   const [refreshKey, setRefreshKey] = useState(0);
   const [scanResults, setScanResults] = useState<ScanResult[]>([]);
   const [theme, setTheme] = useState<'light' | 'dark' | 'system'>('system');
+
+  const handleSelectionChange = (next: string[] | null) => {
+    setSelectedCidrs(next);
+    try {
+      if (next === null) localStorage.removeItem('CF_SELECTED_CIDRS');
+      else localStorage.setItem('CF_SELECTED_CIDRS', JSON.stringify(next));
+    } catch { /* 忽略 */ }
+  };
+
+  const handleCfIpsLoaded = (data: CloudflareIps) => {
+    setCfIps(data);
+    // 同步后掉队的段从选中里去掉，避免选了不存在的段
+    setSelectedCidrs(prev => {
+      if (prev === null) return prev;
+      const alive = new Set([...(data.ipv4_cidrs ?? []), ...(data.cm_cidrs ?? [])]);
+      const pruned = prev.filter(c => alive.has(c));
+      if (pruned.length !== prev.length) {
+        try { localStorage.setItem('CF_SELECTED_CIDRS', JSON.stringify(pruned)); } catch { /* 忽略 */ }
+        return pruned;
+      }
+      return prev;
+    });
+  };
 
   useEffect(() => {
     const savedAuth = localStorage.getItem('auth_token');
@@ -128,11 +158,11 @@ function App() {
         </header>
 
         <main>
-          <CloudflareIpList onDataLoaded={setCfIps} />
+          <CloudflareIpList onDataLoaded={handleCfIpsLoaded} selectedCidrs={selectedCidrs} onSelectionChange={handleSelectionChange} />
           
           <ThirdPartySource />
           
-          <ScannerConfig cfIps={cfIps} onScanComplete={setScanResults} />
+          <ScannerConfig cfIps={cfIps} selectedCidrs={selectedCidrs} onScanComplete={setScanResults} />
           <ScannerResults scanResults={scanResults} onSaveSuccess={() => setRefreshKey(k => k + 1)} />
 
           <SavedIpList key={refreshKey} />

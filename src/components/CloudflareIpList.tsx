@@ -2,12 +2,16 @@ import { useState, useEffect } from 'react';
 import { CloudflareIps, getCloudflareIps, syncCloudflareIps } from '../api';
 import { Cloud, RotateCw, ChevronDown, ChevronUp } from 'lucide-react';
 import { useToast } from './Toast';
+import { totalIps, formatIpCount } from '../utils/scanner';
 
 interface CloudflareIpListProps {
     onDataLoaded: (data: CloudflareIps) => void;
+    /** null = 全部段（默认）；数组 = 只扫选中段，空数组 = 未选任何段 */
+    selectedCidrs: string[] | null;
+    onSelectionChange: (next: string[] | null) => void;
 }
 
-export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
+export function CloudflareIpList({ onDataLoaded, selectedCidrs, onSelectionChange }: CloudflareIpListProps) {
     const [cfIps, setCfIps] = useState<CloudflareIps | null>(null);
     const [loading, setLoading] = useState(false);
     const { showToast } = useToast();
@@ -63,6 +67,37 @@ export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
         loadData();
     }, []);
 
+    /** 全部段（两边合起来），用于计数与全选判断 */
+    const allCidrs = [...(cfIps?.ipv4_cidrs ?? []), ...(cfIps?.cm_cidrs ?? [])];
+    const selectedCount = selectedCidrs === null ? allCidrs.length : selectedCidrs.length;
+    const selectedTotal = selectedCidrs === null ? totalIps(allCidrs) : totalIps(selectedCidrs);
+
+    /** 点一段：默认全选时点一下变成只选这一段；已选的点一下取消 */
+    const toggleCidr = (cidr: string) => {
+        if (selectedCidrs === null) {
+            onSelectionChange([cidr]);
+        } else if (selectedCidrs.includes(cidr)) {
+            onSelectionChange(selectedCidrs.filter(c => c !== cidr));
+        } else {
+            onSelectionChange([...selectedCidrs, cidr]);
+        }
+    };
+
+    const renderCidrChip = (cidr: string) => {
+        const selected = selectedCidrs === null || selectedCidrs.includes(cidr);
+        return (
+            <button
+                key={cidr}
+                type="button"
+                onClick={() => toggleCidr(cidr)}
+                title={selected ? '点击取消选择此段' : '点击选择此段'}
+                className={selected
+                    ? 'bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 border border-indigo-300 dark:border-indigo-600 px-2 py-1 rounded text-xs font-mono hover:bg-indigo-200 dark:hover:bg-indigo-800/50 transition-colors'
+                    : 'bg-gray-100 dark:bg-gray-700 text-gray-400 dark:text-gray-500 border border-transparent px-2 py-1 rounded text-xs font-mono hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors'}
+            >{cidr}</button>
+        );
+    };
+
     return (
         <div className="bg-white dark:bg-gray-800 shadow-md rounded-lg p-6 mb-8">
             <div className="flex items-center gap-4 mb-6">
@@ -94,10 +129,30 @@ export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
 
             {collapsed ? (
                 <p className="text-sm text-gray-500 dark:text-gray-400">
-                    {cfIps ? `CF官方IP段 ${cfIps.ipv4_cidrs.length} 个 · CM整理IP段 ${cfIps.cm_cidrs.length} 个` : 'IP 段加载中…'}
+                    {cfIps ? `CF官方IP段 ${cfIps.ipv4_cidrs.length} 个 · CM整理IP段 ${cfIps.cm_cidrs.length} 个${selectedCidrs === null ? '' : ` · 已选 ${selectedCount} 段`}` : 'IP 段加载中…'}
                 </p>
             ) : (
                 <>
+            <div className="flex flex-wrap items-center gap-2 mb-4">
+                <button
+                    type="button"
+                    onClick={() => onSelectionChange(null)}
+                    className="px-2.5 py-1 text-xs font-medium text-indigo-600 bg-indigo-100 rounded-full hover:bg-indigo-200 dark:bg-indigo-900/50 dark:text-indigo-300 dark:hover:bg-indigo-800/50 transition-colors"
+                >全选</button>
+                <button
+                    type="button"
+                    onClick={() => onSelectionChange([])}
+                    className="px-2.5 py-1 text-xs font-medium text-gray-600 bg-gray-100 rounded-full hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600 transition-colors"
+                >清空</button>
+                <span className="text-xs text-gray-500 dark:text-gray-400">
+                    {selectedCidrs === null
+                        ? `全部 ${selectedCount} 段 · 共约 ${formatIpCount(selectedTotal)} 个 IP`
+                        : selectedCount === 0
+                            ? '未选任何段，扫描前请先选一段'
+                            : `已选 ${selectedCount} 段 · 共约 ${formatIpCount(selectedTotal)} 个 IP`}
+                </span>
+                <span className="text-xs text-gray-400 dark:text-gray-500">点一段只扫它；随机数 ≥ 段内总数时全扫，小于则随机抽。</span>
+            </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div>
                   <div className="flex items-center gap-2 mb-3">
@@ -105,9 +160,7 @@ export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
                     <span className="text-xs text-gray-400 dark:text-gray-500">cloudflare官方公布的ip段，覆盖最全</span>
                   </div>
                   <div className="flex flex-wrap gap-2">
-                    {cfIps?.ipv4_cidrs && cfIps.ipv4_cidrs.length > 0 ? cfIps.ipv4_cidrs.map(cidr => (
-                      <span key={cidr} className="bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 px-2 py-1 rounded text-xs font-mono">{cidr}</span>
-                    )) : <p className="text-gray-400 text-xs italic">暂无数据</p>}
+                    {cfIps?.ipv4_cidrs && cfIps.ipv4_cidrs.length > 0 ? cfIps.ipv4_cidrs.map(renderCidrChip) : <p className="text-gray-400 text-xs italic">暂无数据</p>}
                   </div>
                 </div>
 
@@ -117,9 +170,7 @@ export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
                     <span className="text-xs text-gray-400 dark:text-gray-500">民间大佬维护IP段，测速成功率高</span>
                   </div>
                   <div className="flex flex-wrap gap-2">
-                    {cfIps?.cm_cidrs && cfIps.cm_cidrs.length > 0 ? cfIps.cm_cidrs.map(cidr => (
-                      <span key={cidr} className="bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 px-2 py-1 rounded text-xs font-mono">{cidr}</span>
-                    )) : <p className="text-gray-400 text-xs italic">暂无数据</p>}
+                    {cfIps?.cm_cidrs && cfIps.cm_cidrs.length > 0 ? cfIps.cm_cidrs.map(renderCidrChip) : <p className="text-gray-400 text-xs italic">暂无数据</p>}
                   </div>
                 </div>
             </div>
