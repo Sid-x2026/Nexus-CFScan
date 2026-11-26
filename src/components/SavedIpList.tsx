@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { getScenes, getSceneResults, saveResults, deleteScene } from '../api';
 import { getLatencyColor, ScanResult, SOURCE_LABELS } from '../utils/scanner';
 import {
@@ -38,6 +38,8 @@ export function SavedIpList() {
     const [loading, setLoading] = useState(false);
     const [selectedScenes, setSelectedScenes] = useState<Set<string>>(new Set());
     const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
+    /** 地区筛选：下拉选一个机房代码（NRT/HKG/ICN…），只看该地区的 IP；'all' 为全部 */
+    const [selectedRegion, setSelectedRegion] = useState<string>('all');
     // 已保存列表平时不常翻，支持收起；状态记在浏览器里，默认展开
     const [collapsed, setCollapsed] = useState(() => {
         try { return localStorage.getItem('CF_SAVED_LIST_COLLAPSED') === '1'; } catch { return false; }
@@ -218,7 +220,23 @@ export function SavedIpList() {
     }, []);
 
     const uniqueScenes = Array.from(new Set(items.map(i => i.sceneName))).sort();
-    const filteredItems = items.filter(i => selectedScenes.has(i.sceneName));
+    /** 地区下拉的选项：只列出已保存数据里实际有的机房，按个数从多到少排 */
+    const regionOptions = useMemo(() => {
+        const counts = new Map<string, number>();
+        for (const item of items) {
+            if (!item.colo) continue;
+            counts.set(item.colo, (counts.get(item.colo) ?? 0) + 1);
+        }
+        return [...counts.entries()]
+            .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+            .map(([colo, count]) => ({ colo, count }));
+    }, [items]);
+    // 选中的地区已被删空时自动回到全部
+    const effectiveRegion = regionOptions.some(r => r.colo === selectedRegion) ? selectedRegion : 'all';
+    const filteredItems = items.filter(i =>
+        selectedScenes.has(i.sceneName) &&
+        (effectiveRegion === 'all' || i.colo === effectiveRegion)
+    );
     const filteredItemsSorted = [...filteredItems].sort((a, b) => {
         return a.latency - b.latency;
     });
@@ -490,6 +508,18 @@ export function SavedIpList() {
                                 );
                             })}
                         </div>
+                        <span className="text-sm font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap ml-2">地区:</span>
+                        <select
+                            value={effectiveRegion}
+                            onChange={(e) => setSelectedRegion(e.target.value)}
+                            className="px-2.5 py-1 text-xs font-medium text-gray-700 bg-white border border-gray-200 rounded-full hover:border-gray-300 dark:bg-gray-800 dark:text-gray-200 dark:border-gray-600 outline-none cursor-pointer"
+                            title="按地区筛选"
+                        >
+                            <option value="all">全部地区</option>
+                            {regionOptions.map(({ colo, count }) => (
+                                <option key={colo} value={colo}>{colo} · {getColoName(colo)}（{count} 个）</option>
+                            ))}
+                        </select>
                         {/* 操作按使用顺序排：先选场景，再勾行测，最后删、刷新 */}
                         <div className="flex flex-wrap items-center gap-2 ml-auto">
                             <button
