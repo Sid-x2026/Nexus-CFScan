@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { CloudflareIps, getCloudflareIps, syncCloudflareIps } from '../api';
-import { Cloud, RotateCw } from 'lucide-react';
+import { Cloud, RotateCw, ChevronDown, ChevronUp } from 'lucide-react';
 import { useToast } from './Toast';
 
 interface CloudflareIpListProps {
@@ -11,6 +11,10 @@ export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
     const [cfIps, setCfIps] = useState<CloudflareIps | null>(null);
     const [loading, setLoading] = useState(false);
     const { showToast } = useToast();
+    // IP 段平时基本不动，默认收起来省地方；点一下展开，状态记在浏览器里
+    const [collapsed, setCollapsed] = useState(() => {
+        try { return localStorage.getItem('CF_IP_RANGES_COLLAPSED') !== '0'; } catch { return true; }
+    });
 
     const loadData = async (retryCount = 3) => {
         setLoading(true);
@@ -64,7 +68,7 @@ export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
             <div className="flex items-center gap-4 mb-6">
                 <Cloud className="w-7 h-7 text-blue-500" />
                 <h2 className="text-2xl font-semibold text-gray-700 dark:text-gray-200">IP段</h2>
-                <button 
+                <button
                     onClick={handleSync}
                     disabled={loading}
                     className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-blue-600 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900/50 dark:text-blue-300 dark:hover:bg-blue-800/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -73,8 +77,27 @@ export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
                     <RotateCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
                     <span>{loading ? '同步中...' : '同步最新IP段'}</span>
                 </button>
+                <button
+                    type="button"
+                    onClick={() => {
+                        const next = !collapsed;
+                        setCollapsed(next);
+                        try { localStorage.setItem('CF_IP_RANGES_COLLAPSED', next ? '1' : '0'); } catch { /* 忽略 */ }
+                    }}
+                    className="ml-auto flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-600 bg-gray-100 rounded-full hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600 transition-colors"
+                    title={collapsed ? '展开 IP 段列表' : '收起 IP 段列表'}
+                >
+                    {collapsed ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronUp className="w-3.5 h-3.5" />}
+                    <span>{collapsed ? '展开' : '收起'}</span>
+                </button>
             </div>
-            
+
+            {collapsed ? (
+                <p className="text-sm text-gray-500 dark:text-gray-400">
+                    {cfIps ? `CF官方IP段 ${cfIps.ipv4_cidrs.length} 个 · CM整理IP段 ${cfIps.cm_cidrs.length} 个` : 'IP 段加载中…'}
+                </p>
+            ) : (
+                <>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div>
                   <div className="flex items-center gap-2 mb-3">
@@ -101,6 +124,8 @@ export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
                 </div>
             </div>
             <p className="text-xs text-gray-400 dark:text-gray-500 mt-4">域名源与第三方源见下方：域名源默认 BestCF 域名列表，第三方源支持填链接、粘贴 IP/域名或本地上传文件。</p>
+                </>
+            )}
         </div>
     );
 }
