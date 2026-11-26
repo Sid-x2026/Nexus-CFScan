@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { CloudflareIps } from './api';
 import { SavedIpList } from './components/SavedIpList';
+import { FissionSubscription } from './components/FissionSubscription';
 import { Login } from './components/Login';
 import { CloudflareIpList } from './components/CloudflareIpList';
 import { ApiDocs } from './components/ApiDocs';
@@ -140,6 +141,8 @@ function App() {
           <ScannerResults scanResults={scanResults} onSaveSuccess={() => setRefreshKey(k => k + 1)} />
 
           <SavedIpList key={refreshKey} />
+
+          <FissionSubscription />
 
           <ApiDocs apiToken={publicApiToken} />
         </main>
