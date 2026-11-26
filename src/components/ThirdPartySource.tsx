@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Globe, Save, Upload } from 'lucide-react';
+import { Globe, Save, Upload, ChevronDown, ChevronUp } from 'lucide-react';
 import { useToast } from './Toast';
 import { getThirdPartySources, saveThirdPartySources } from '../api';
 import { parseDirectEntries } from '../utils/scanner';
@@ -18,6 +18,10 @@ export function ThirdPartySource() {
     const [directText, setDirectText] = useState<string>(
         () => localStorage.getItem(THIRD_DIRECT_KEY) || ''
     );
+    // 自定义源平时基本不动，默认收起来省地方；点一下展开，状态记在浏览器里
+    const [collapsed, setCollapsed] = useState(() => {
+        try { return localStorage.getItem('CF_THIRD_PARTY_COLLAPSED') !== '0'; } catch { return true; }
+    });
     const fileRef = useRef<HTMLInputElement>(null);
     const { showToast } = useToast();
 
@@ -87,17 +91,38 @@ export function ThirdPartySource() {
             <div className="flex items-center justify-between gap-4 mb-4">
                 <div className="flex items-center gap-3">
                     <Globe className="w-7 h-7 text-indigo-500" />
-                    <h2 className="text-2xl font-semibold text-gray-700 dark:text-gray-200">第三方 IP/域名 源</h2>
+                    <h2 className="text-2xl font-semibold text-gray-700 dark:text-gray-200">自定义 IP 源</h2>
                 </div>
-                <button
-                    onClick={handleSave}
-                    disabled={isSaving || loading}
-                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-indigo-600 bg-indigo-100 rounded-full hover:bg-indigo-200 dark:bg-indigo-900/50 dark:text-indigo-300 dark:hover:bg-indigo-800/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                    <Save className="w-3.5 h-3.5" />
-                    {isSaving ? '保存中...' : '保存'}
-                </button>
+                <div className="flex items-center gap-2">
+                    <button
+                        onClick={handleSave}
+                        disabled={isSaving || loading}
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-indigo-600 bg-indigo-100 rounded-full hover:bg-indigo-200 dark:bg-indigo-900/50 dark:text-indigo-300 dark:hover:bg-indigo-800/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                        <Save className="w-3.5 h-3.5" />
+                        {isSaving ? '保存中...' : '保存'}
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => {
+                            const next = !collapsed;
+                            setCollapsed(next);
+                            try { localStorage.setItem('CF_THIRD_PARTY_COLLAPSED', next ? '1' : '0'); } catch { /* 忽略 */ }
+                        }}
+                        className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-600 bg-gray-100 rounded-full hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600 transition-colors"
+                        title={collapsed ? '展开自定义源' : '收起自定义源'}
+                    >
+                        {collapsed ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronUp className="w-3.5 h-3.5" />}
+                        <span>{collapsed ? '展开' : '收起'}</span>
+                    </button>
+                </div>
             </div>
+            {collapsed ? (
+                <p className="text-sm text-gray-500 dark:text-gray-400">
+                    链接源 {urls.split('\n').map(s => s.trim()).filter(Boolean).length} 条 · 直接条目 {directCount} 条
+                </p>
+            ) : (
+                <>
             <div className="line-editor flex rounded-md border dark:border-gray-600 overflow-hidden font-mono text-sm" style={{ height: 10 * LINE_HEIGHT + 8 }}>
                 <div
                     className="gutter flex-none select-none text-right text-gray-400 dark:text-gray-500 bg-gray-50 dark:bg-gray-900/40 border-r dark:border-gray-600 pb-2 px-2 overflow-hidden"
@@ -177,6 +202,8 @@ export function ThirdPartySource() {
                     className="w-full p-3 border rounded-md text-sm font-mono dark:bg-gray-700 dark:border-gray-600 dark:text-white focus:ring-2 focus:ring-indigo-500 outline-none resize-y"
                 />
             </div>
+                </>
+            )}
         </div>
     );
 }

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { getScenes, getSceneResults, saveResults } from '../api';
+import { getScenes, getSceneResults, saveResults, deleteScene } from '../api';
 import { getLatencyColor, ScanResult, SOURCE_LABELS } from '../utils/scanner';
 import {
     probeLocalAgent, probeSingle, speedSingle, DEFAULT_AGENT_PORT, AGENT_BUSY_ERROR,
@@ -8,7 +8,7 @@ import {
 import { getColoName } from '../utils/colo';
 import { useToast } from './Toast';
 import { useConfirm } from './ConfirmDialog'; // Import Trash2 and RotateCw
-import { ListChecks, Trash2, RotateCw, FileText, File, Copy } from 'lucide-react';
+import { ListChecks, Trash2, RotateCw, FileText, File, Copy, ChevronDown, ChevronUp } from 'lucide-react';
 import { RegionDisplay } from './RegionDisplay';
 
 /** 与 ScannerConfig 的探针域名输入框共用同一个 localStorage 键 */
@@ -38,6 +38,10 @@ export function SavedIpList() {
     const [loading, setLoading] = useState(false);
     const [selectedScenes, setSelectedScenes] = useState<Set<string>>(new Set());
     const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
+    // 已保存列表平时不常翻，支持收起；状态记在浏览器里，默认展开
+    const [collapsed, setCollapsed] = useState(() => {
+        try { return localStorage.getItem('CF_SAVED_LIST_COLLAPSED') === '1'; } catch { return false; }
+    });
     const { showToast } = useToast();
     const { confirm } = useConfirm();
 
@@ -266,13 +270,42 @@ export function SavedIpList() {
                 const sceneItems = items.filter(i => i.sceneName === scene);
                 const keepItems = sceneItems.filter(item => !selectedItems.has(`${item.ip}:${item.port}#${item.sceneName}`));
 
-                const resultsToSave = keepItems.map(({ sceneName, ...rest }) => rest);
-                await saveResults(scene, resultsToSave as ScanResult[], 'overwrite');
+                if (keepItems.length === 0) {
+                    // 删空了：直接删掉整个场景，不留空壳
+                    await deleteScene(scene);
+                } else {
+                    const resultsToSave = keepItems.map(({ sceneName, ...rest }) => rest);
+                    await saveResults(scene, resultsToSave as ScanResult[], 'overwrite');
+                }
             }
             setSelectedItems(new Set());
             await loadData();
         } catch (e) {
             showToast('删除失败', 'error');
+            setLoading(false);
+        }
+    };
+
+    const handleDeleteScene = async (scene: string) => {
+        const count = items.filter(i => i.sceneName === scene).length;
+        const isConfirmed = await confirm(`确定要删除场景「${scene}」吗？其中的 ${count} 个IP/域名会一起删除，删除后无法恢复。`, {
+            confirmText: '确定删除',
+        });
+        if (!isConfirmed) return;
+
+        setLoading(true);
+        try {
+            await deleteScene(scene);
+            setSelectedItems(new Set([...selectedItems].filter(id => !id.endsWith(`#${scene}`))));
+            setSelectedScenes(prev => {
+                const next = new Set(prev);
+                next.delete(scene);
+                return next;
+            });
+            showToast(`场景「${scene}」已删除`, 'success');
+            await loadData();
+        } catch (e) {
+            showToast('删除场景失败', 'error');
             setLoading(false);
         }
     };
@@ -388,78 +421,77 @@ export function SavedIpList() {
 
     return (
         <div className="bg-white dark:bg-gray-800 shadow-md rounded-lg p-6 mb-8">
-            <div className="flex flex-col gap-4 mb-4">
-                <div className="flex items-center justify-between flex-wrap gap-4">
+            <div className="flex items-center justify-between flex-wrap gap-4 mb-4">
                     <div className="flex items-center gap-3">
                         <ListChecks className="w-7 h-7 text-green-500" />
-                        <h2 className="text-2xl font-semibold text-gray-700 dark:text-gray-200">已保存的 IP/域名 列表</h2>
+                        <h2 className="text-2xl font-semibold text-gray-700 dark:text-gray-200">已保存 IP 库</h2>
                         <span className="px-2.5 py-0.5 bg-green-100 text-green-800 text-sm font-semibold rounded-full dark:bg-green-900 dark:text-green-300">{items.length} 个IP/域名</span>
                     </div>
-                    <div className="flex items-center gap-4">
-                        {selectedItems.size > 0 && (
-                            <button
-                                onClick={handleDeleteSelected}
-                                className="px-4 py-1.5 text-sm font-medium text-red-800 bg-red-100 rounded-full hover:bg-red-200 dark:bg-red-900 dark:text-red-300 dark:hover:bg-red-800 transition-colors"
-                            >
-                                <Trash2 className="w-4 h-4 mr-1 inline-block" />
-                                删除选中 ({selectedItems.size})
-                            </button>
-                        )}
-                        <button
-                            onClick={loadData}
-                            className="px-4 py-1.5 text-sm font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors"
-                        >
-                            <RotateCw className="w-4 h-4 mr-1 inline-block" />
-                            刷新
-                        </button>
-                        {/* 批量测试：只测已勾选的行，最多 4 个并发 */}
-                        <span className="text-xs text-gray-500 dark:text-gray-400">已勾选 {selectedItems.size} 个</span>
-                        <button
-                            type="button"
-                            onClick={() => handleBatchClick('probe')}
-                            disabled={batchKind !== null}
-                            className="px-4 py-1.5 text-sm font-medium text-teal-800 bg-teal-100 rounded-full hover:bg-teal-200 dark:bg-teal-900 dark:text-teal-300 dark:hover:bg-teal-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                        >
-                            {batchKind === 'probe' ? `探针复检中 ${batchDone}/${batchTotal}…` : '一键探针复检'}
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => handleBatchClick('speed')}
-                            disabled={batchKind !== null}
-                            className="px-4 py-1.5 text-sm font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                        >
-                            {batchKind === 'speed' ? `测速中 ${batchDone}/${batchTotal}…` : '一键测速'}
-                        </button>
-                    </div>
+                    <button
+                        type="button"
+                        onClick={() => {
+                            const next = !collapsed;
+                            setCollapsed(next);
+                            try { localStorage.setItem('CF_SAVED_LIST_COLLAPSED', next ? '1' : '0'); } catch { /* 忽略 */ }
+                        }}
+                        className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-600 bg-gray-100 rounded-full hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600 transition-colors"
+                        title={collapsed ? '展开已保存列表' : '收起已保存列表'}
+                    >
+                        {collapsed ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronUp className="w-3.5 h-3.5" />}
+                        <span>{collapsed ? '展开' : '收起'}</span>
+                    </button>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-3 p-3 bg-gray-50 dark:bg-gray-700 rounded-lg">
+            {collapsed ? (
+                <p className="text-sm text-gray-500 dark:text-gray-400">
+                    {items.length > 0 ? `共 ${items.length} 个 IP/域名 · ${uniqueScenes.length} 个场景` : '暂无已保存的 IP'}
+                </p>
+            ) : (
+                <>
+                <div className="flex flex-wrap items-center gap-3 p-3 bg-gray-50 dark:bg-gray-700 rounded-lg mb-4">
                     <span className="text-sm font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap">场景过滤:</span>
                     <div className="flex flex-wrap items-center gap-2">
                         {uniqueScenes.map(scene => {
                             const isSelected = selectedScenes.has(scene);
                             return (
-                                <button
+                                <span
                                     key={scene}
-                                    type="button"
-                                    onClick={() => {
-                                        const newSet = new Set(selectedScenes);
-                                        if (newSet.has(scene)) newSet.delete(scene);
-                                        else newSet.add(scene);
-                                        setSelectedScenes(newSet);
-                                    }}
-                                    className={`px-2.5 py-1 text-xs font-medium rounded-full border transition-colors ${
+                                    className={`inline-flex items-center rounded-full border transition-colors ${
                                         isSelected
                                             ? 'bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100 dark:bg-indigo-900/40 dark:text-indigo-200 dark:border-indigo-700/60 dark:hover:bg-indigo-800/60'
                                             : 'bg-gray-100 text-gray-500 border-gray-200 dark:bg-gray-700 dark:text-gray-400 dark:border-gray-600'
                                     }`}
                                 >
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            const newSet = new Set(selectedScenes);
+                                            if (newSet.has(scene)) newSet.delete(scene);
+                                            else newSet.add(scene);
+                                            setSelectedScenes(newSet);
+                                        }}
+                                        className="px-2.5 py-1 text-xs font-medium"
+                                    >
                                         {scene}
                                     </button>
+                                    <button
+                                        type="button"
+                                        title={`删除场景 ${scene}`}
+                                        aria-label={`删除场景 ${scene}`}
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            void handleDeleteScene(scene);
+                                        }}
+                                        className="pr-2 pl-0.5 py-1 text-xs font-bold leading-none opacity-60 hover:opacity-100 hover:text-red-600"
+                                    >
+                                        ×
+                                    </button>
+                                </span>
                                 );
                             })}
                         </div>
-                        <div className="flex items-center gap-3 ml-auto">
+                        {/* 操作按使用顺序排：先选场景，再勾行测，最后删、刷新 */}
+                        <div className="flex flex-wrap items-center gap-2 ml-auto">
                             <button
                                 type="button"
                                 onClick={() => setSelectedScenes(new Set(uniqueScenes))}
@@ -474,9 +506,43 @@ export function SavedIpList() {
                             >
                                 清空
                             </button>
+                            <span className="w-px h-5 bg-gray-300 dark:bg-gray-600 mx-1" aria-hidden />
+                            <span className="text-xs text-gray-500 dark:text-gray-400">已勾选 {selectedItems.size} 个</span>
+                            {/* 批量测试：只测已勾选的行，最多 4 个并发 */}
+                            <button
+                                type="button"
+                                onClick={() => handleBatchClick('probe')}
+                                disabled={batchKind !== null}
+                                className="px-3 py-1 text-xs font-medium text-teal-800 bg-teal-100 rounded-full hover:bg-teal-200 dark:bg-teal-900 dark:text-teal-300 dark:hover:bg-teal-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                {batchKind === 'probe' ? `探针复检中 ${batchDone}/${batchTotal}…` : '一键探针复检'}
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => handleBatchClick('speed')}
+                                disabled={batchKind !== null}
+                                className="px-3 py-1 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                {batchKind === 'speed' ? `测速中 ${batchDone}/${batchTotal}…` : '一键测速'}
+                            </button>
+                            {selectedItems.size > 0 && (
+                                <button
+                                    onClick={handleDeleteSelected}
+                                    className="px-3 py-1 text-xs font-medium text-red-800 bg-red-100 rounded-full hover:bg-red-200 dark:bg-red-900 dark:text-red-300 dark:hover:bg-red-800 transition-colors"
+                                >
+                                    <Trash2 className="w-3.5 h-3.5 mr-1 inline-block" />
+                                    删除选中 ({selectedItems.size})
+                                </button>
+                            )}
+                            <button
+                                onClick={loadData}
+                                className="px-3 py-1 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors"
+                            >
+                                <RotateCw className="w-3.5 h-3.5 mr-1 inline-block" />
+                                刷新
+                            </button>
                         </div>
                 </div>
-            </div>
 
             <div className="overflow-auto" style={{ maxHeight: '600px' }}>
                 <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
@@ -578,6 +644,8 @@ export function SavedIpList() {
                         复制
                     </button>
             </div>
+                </>
+            )}
         </div>
     );
 }

@@ -33,7 +33,7 @@ import {
     type AgentResult, type AgentProbeResult,
 } from '../utils/localAgent';
 import { useToast } from './Toast';
-import { Gauge, Play, StopCircle, Loader2, Square, Cpu, RefreshCw, Download } from 'lucide-react';
+import { Gauge, Play, StopCircle, Loader2, Square, Cpu, RefreshCw, Download, ChevronDown, ChevronUp } from 'lucide-react';
 import { useConfirm } from './ConfirmDialog';
 
 interface IpScannerConfigAndControlProps {
@@ -121,6 +121,10 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
     }, [count, threads, latencyLimit, lossLimit, rounds, jitterStable, jitterBackup, timeoutMs, topN, speedUrl, scanMode, coloFilter]);
 
     const [ipSource, setIpSource] = useState<SourceKind>('cf');
+    // 测速配置平时不常改，支持收起；状态记在浏览器里，默认展开
+    const [collapsed, setCollapsed] = useState(() => {
+        try { return localStorage.getItem('CF_SCAN_CONFIG_COLLAPSED') === '1'; } catch { return false; }
+    });
     const [isScanning, setIsScanning] = useState(false);
     const [progress, setProgress] = useState(0);
     const [total, setTotal] = useState(0);
@@ -327,7 +331,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
             const directItems = parseDirectEntries([...directLines, directText].join('\n'), selectedPort);
 
             if (urlSources.length === 0 && directItems.length === 0) {
-                showToast('未配置第三方源，请先到"第三方 IP/域名 源"中添加链接、IP 或上传文件', 'warning');
+                showToast('未配置第三方源，请先到"自定义 IP 源"中添加链接、IP 或上传文件', 'warning');
                 return null;
             }
 
@@ -706,10 +710,29 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
         <div className="bg-white dark:bg-gray-800 shadow-md rounded-lg p-6 mb-8">
             <div className="flex items-center gap-3 mb-4">
                 <Gauge className="w-7 h-7 text-purple-500" />
-                <h2 className="text-2xl font-semibold text-gray-700 dark:text-gray-200">IP优选测速</h2>
+                <h2 className="text-2xl font-semibold text-gray-700 dark:text-gray-200">优选 IP 扫描</h2>
                 <span className="px-2 py-0.5 text-xs rounded-full bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300">本地测速</span>
+                <button
+                    type="button"
+                    onClick={() => {
+                        const next = !collapsed;
+                        setCollapsed(next);
+                        try { localStorage.setItem('CF_SCAN_CONFIG_COLLAPSED', next ? '1' : '0'); } catch { /* 忽略 */ }
+                    }}
+                    className="ml-auto flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-600 bg-gray-100 rounded-full hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600 transition-colors"
+                    title={collapsed ? '展开扫描配置' : '收起扫描配置'}
+                >
+                    {collapsed ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronUp className="w-3.5 h-3.5" />}
+                    <span>{collapsed ? '展开' : '收起'}</span>
+                </button>
             </div>
 
+            {collapsed ? (
+                <p className="text-sm text-gray-500 dark:text-gray-400">
+                    来源 {SOURCE_LABELS[ipSource]} · 延迟 ≤{latencyLimit}ms · 丢包 ≤{lossLimit}% · 机房 {coloFilter.length} 个
+                </p>
+            ) : (
+                <>
             <div className="flex items-center mb-4">
                 <label className="text-gray-700 dark:text-gray-300 font-semibold mr-3">IP来源:</label>
                 <div className="relative flex w-fit items-center rounded-lg bg-gray-100 p-1 dark:bg-gray-700">
@@ -750,25 +773,25 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                 </div>
             )}
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-3">
                 <div>
-                    <label htmlFor="ip-count" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">随机IP数量:</label>
+                    <label htmlFor="ip-count" className="block text-gray-700 dark:text-gray-300 text-sm font-semibold mb-1">随机IP数量:</label>
                     <input
                         id="ip-count"
                         type="text"
                         value={count}
                         onChange={(e) => { setCount(e.target.value); if (countError) setCountError(''); }}
-                        className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
+                        className="shadow appearance-none border rounded w-full py-1.5 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
                         disabled={isScanning || isPreparing || ipSource === 'third' || ipSource === 'domain'}
                     />
                     {countError && <p className="text-red-500 text-xs mt-1">{countError}</p>}
                 </div>
                 <div>
-                    <label htmlFor="port-select" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">端口:</label>
+                    <label htmlFor="port-select" className="block text-gray-700 dark:text-gray-300 text-sm font-semibold mb-1">端口:</label>
                     <select id="port-select" value={portSelectValue} onChange={(e) => {
                         if (e.target.value === 'random') setPortMode('random');
                         else { setPortMode('fixed'); setSelectedPort(Number(e.target.value)); }
-                    }} className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50" disabled={isScanning || isPreparing}>
+                    }} className="shadow appearance-none border rounded w-full py-1.5 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50" disabled={isScanning || isPreparing}>
                         {CF_PORTS.map(port => (
                             <option key={port} value={port}>{port}</option>
                         ))}
@@ -777,119 +800,119 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                     <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">固定端口或随机（443 / 2053 / 2083 / 2087 / 2096 / 8443）</p>
                 </div>
                 <div>
-                    <label htmlFor="threads-count" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">线程数:</label>
+                    <label htmlFor="threads-count" className="block text-gray-700 dark:text-gray-300 text-sm font-semibold mb-1">线程数:</label>
                     <input
                         id="threads-count"
                         type="text"
                         value={threads}
                         onChange={(e) => { setThreads(e.target.value); if (threadsError) setThreadsError(''); }}
-                        className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
+                        className="shadow appearance-none border rounded w-full py-1.5 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
                         disabled={isScanning || isPreparing}
                     />
                     {threadsError && <p className="text-red-500 text-xs mt-1">{threadsError}</p>}
                 </div>
                 <div>
-                    <label htmlFor="latency-limit" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">延迟限制(ms):</label>
+                    <label htmlFor="latency-limit" className="block text-gray-700 dark:text-gray-300 text-sm font-semibold mb-1">延迟限制(ms):</label>
                     <input
                         id="latency-limit"
                         type="text"
                         value={latencyLimit}
                         onChange={(e) => { setLatencyLimit(e.target.value); if (latencyLimitError) setLatencyLimitError(''); }}
-                        className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
+                        className="shadow appearance-none border rounded w-full py-1.5 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
                         disabled={isScanning || isPreparing}
                     />
                     {latencyLimitError && <p className="text-red-500 text-xs mt-1">{latencyLimitError}</p>}
                 </div>
                 <div>
-                    <label htmlFor="loss-limit" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">丢包上限(%):</label>
+                    <label htmlFor="loss-limit" className="block text-gray-700 dark:text-gray-300 text-sm font-semibold mb-1">丢包上限(%):</label>
                     <input
                         id="loss-limit"
                         type="text"
                         value={lossLimit}
                         onChange={(e) => { setLossLimit(e.target.value); if (lossLimitError) setLossLimitError(''); }}
-                        className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
+                        className="shadow appearance-none border rounded w-full py-1.5 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
                         disabled={isScanning || isPreparing}
                     />
                     {lossLimitError && <p className="text-red-500 text-xs mt-1">{lossLimitError}</p>}
                     <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">3 次均须达标</p>
                 </div>
                 <div>
-                    <label htmlFor="rounds" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">测速轮次:</label>
+                    <label htmlFor="rounds" className="block text-gray-700 dark:text-gray-300 text-sm font-semibold mb-1">测速轮次:</label>
                     <input
                         id="rounds"
                         type="text"
                         value={rounds}
                         onChange={(e) => { setRounds(e.target.value); if (roundsError) setRoundsError(''); }}
-                        className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
+                        className="shadow appearance-none border rounded w-full py-1.5 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
                         disabled={isScanning || isPreparing}
                     />
                     {roundsError && <p className="text-red-500 text-xs mt-1">{roundsError}</p>}
                     <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">每次测 3 次，取最好一次</p>
                 </div>
                 <div>
-                    <label htmlFor="jitter-stable" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">抖动优先(ms):</label>
+                    <label htmlFor="jitter-stable" className="block text-gray-700 dark:text-gray-300 text-sm font-semibold mb-1">抖动优先(ms):</label>
                     <input
                         id="jitter-stable"
                         type="text"
                         value={jitterStable}
                         onChange={(e) => { setJitterStable(e.target.value); if (jitterError) setJitterError(''); }}
-                        className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
+                        className="shadow appearance-none border rounded w-full py-1.5 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
                         disabled={isScanning || isPreparing}
                     />
                 </div>
                 <div>
-                    <label htmlFor="jitter-backup" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">抖动备用(ms):</label>
+                    <label htmlFor="jitter-backup" className="block text-gray-700 dark:text-gray-300 text-sm font-semibold mb-1">抖动备用(ms):</label>
                     <input
                         id="jitter-backup"
                         type="text"
                         value={jitterBackup}
                         onChange={(e) => { setJitterBackup(e.target.value); if (jitterError) setJitterError(''); }}
-                        className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
+                        className="shadow appearance-none border rounded w-full py-1.5 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
                         disabled={isScanning || isPreparing}
                     />
                     {jitterError && <p className="text-red-500 text-xs mt-1">{jitterError}</p>}
                     <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">≤优先值优先，≤备用值备用，超过降级</p>
                 </div>
                 <div>
-                    <label htmlFor="timeout-ms" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">超时(ms):</label>
+                    <label htmlFor="timeout-ms" className="block text-gray-700 dark:text-gray-300 text-sm font-semibold mb-1">超时(ms):</label>
                     <input
                         id="timeout-ms"
                         type="text"
                         value={timeoutMs}
                         onChange={(e) => { setTimeoutMs(e.target.value); if (timeoutError) setTimeoutError(''); }}
-                        className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
+                        className="shadow appearance-none border rounded w-full py-1.5 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
                         disabled={isScanning || isPreparing}
                     />
                     {timeoutError && <p className="text-red-500 text-xs mt-1">{timeoutError}</p>}
                 </div>
                 <div>
-                    <label htmlFor="top-n" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">输出数量:</label>
+                    <label htmlFor="top-n" className="block text-gray-700 dark:text-gray-300 text-sm font-semibold mb-1">输出数量:</label>
                     <input
                         id="top-n"
                         type="text"
                         value={topN}
                         onChange={(e) => { setTopN(e.target.value); if (topNError) setTopNError(''); }}
-                        className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
+                        className="shadow appearance-none border rounded w-full py-1.5 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
                         disabled={isScanning || isPreparing}
                     />
                     {topNError && <p className="text-red-500 text-xs mt-1">{topNError}</p>}
                     <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">按延迟排序取前 N 条</p>
                 </div>
                 <div>
-                    <label htmlFor="speed-url" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">测速地址:</label>
+                    <label htmlFor="speed-url" className="block text-gray-700 dark:text-gray-300 text-sm font-semibold mb-1">测速地址:</label>
                     <input
                         id="speed-url"
                         type="text"
                         value={speedUrl}
                         onChange={(e) => setSpeedUrl(e.target.value)}
                         placeholder="auto"
-                        className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
+                        className="shadow appearance-none border rounded w-full py-1.5 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
                         disabled={isScanning || isPreparing}
                     />
                     <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">auto 为后端自动选择</p>
                 </div>
                 <div>
-                    <label className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">扫描方式:</label>
+                    <label className="block text-gray-700 dark:text-gray-300 text-sm font-semibold mb-1">扫描方式:</label>
                     <div className="flex w-fit items-center rounded-lg bg-gray-100 p-1 dark:bg-gray-700">
                         <button
                             type="button"
@@ -910,15 +933,16 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                     </div>
                     <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">TCPing 为 TCP 握手延迟，HTTPing 为 TTFB</p>
                 </div>
-                <div>
-                    <label htmlFor="probe-host" className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">探针域名:</label>
+                {/* 探针域名单独占一行满宽：之前单占一格，右边空了三格 */}
+                <div className="sm:col-span-2 lg:col-span-4">
+                    <label htmlFor="probe-host" className="block text-gray-700 dark:text-gray-300 text-sm font-semibold mb-1">探针域名:</label>
                     <input
                         id="probe-host"
                         type="text"
                         value={probeHost}
                         onChange={(e) => setProbeHost(e.target.value)}
                         placeholder="如 jpagxr.sidns.xyz，留空则用 speed.cloudflare.com"
-                        className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
+                        className="shadow appearance-none border rounded w-full py-1.5 px-3 text-gray-700 dark:text-white dark:bg-gray-700 dark:border-gray-600 leading-tight focus:outline-none focus:shadow-outline disabled:opacity-50"
                         disabled={isScanning || isPreparing}
                     />
                     <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">填节点域名，后端用它当 SNI 探针，通不了的优选 IP 直接筛掉；留空则用 speed.cloudflare.com</p>
@@ -927,7 +951,7 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
 
             {/* 机房筛选：常用机房全有（亚洲 + 美国 + 欧洲），默认只勾亚洲 5 个 */}
             <div className="mb-4">
-                <label className="block text-gray-700 dark:text-gray-300 text-sm font-bold mb-1">机房筛选:</label>
+                <label className="block text-gray-700 dark:text-gray-300 text-sm font-semibold mb-1">机房筛选:</label>
                 <div className="space-y-2">
                     {([['亚洲', ASIAN_COLOS], ['美国', US_COLOS], ['欧洲', EU_COLOS]] as const).map(([region, colos]) => (
                         <div key={region} className="flex flex-wrap items-center gap-2">
@@ -1131,6 +1155,8 @@ export function ScannerConfig({ cfIps, onScanComplete }: IpScannerConfigAndContr
                         去重后可用：<strong className="text-green-600">{lastScanSummary.dedupQualified}</strong> 个 / 共测 {lastScanSummary.totalTested} 个
                     </div>
                 </div>
+            )}
+                </>
             )}
 
             {isScanning && (() => {

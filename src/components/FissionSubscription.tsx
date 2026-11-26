@@ -129,7 +129,6 @@ export function FissionSubscription() {
             .map((r) => ({
                 // 域名源用解析出的实际 IP，其余用 IP 本身
                 addr: r.resolvedIp || r.ip,
-                suffix: r.colo ? `${r.colo} ${r.latency}ms` : r.ip,
             }));
     }, [source, customParsed, sortedItems, checked]);
 
@@ -220,9 +219,16 @@ export function FissionSubscription() {
             {
                 key: 'v2ray',
                 label: 'V2Ray',
-                desc: '通用订阅 · V2RayN / Shadowrocket 等',
+                desc: '通用订阅 · V2RayN 等',
                 content: subOutputs.v2ray,
                 file: 'nexus-fission-v2ray.txt',
+            },
+            {
+                key: 'shadowrocket',
+                label: 'Shadowrocket',
+                desc: 'iOS 小火箭 · 与 V2Ray 订阅同内容',
+                content: subOutputs.v2ray,
+                file: 'nexus-fission-shadowrocket.txt',
             },
             {
                 key: 'clash',
@@ -447,7 +453,7 @@ export function FissionSubscription() {
                 className="w-full p-3 border rounded-md font-mono text-sm dark:bg-gray-600 dark:border-gray-500 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none mb-2"
             />
             <p className="text-xs text-gray-500 dark:text-gray-400 mb-6">
-                两种给法都行：上面填订阅链接点拉取，或下面直接粘贴节点。只存在浏览器本地，下次打开不用再贴。裂变后每条隧道节点的备注会加上机房和延迟（如 丨HKG 60ms），方便在客户端里区分；场景模式的端口沿用原生链接的端口。
+                两种给法都行：上面填订阅链接点拉取，或下面直接粘贴节点。只存在浏览器本地，下次打开不用再贴。节点名称只按命名规则来：前缀|地区|原协议名称，不再追加机房、延迟。场景模式的端口沿用原生链接的端口。
             </p>
 
             {/* ③ 分配方式 + 节点命名 */}
@@ -504,7 +510,7 @@ export function FissionSubscription() {
                 </label>
             </div>
             <p className="text-xs text-gray-500 dark:text-gray-400 mb-6">
-                示例：前缀填「裂变」、地区填「日本」→ 裂变|日本|Argo丨Xray丨xhttp_h2丨NRT 60ms。两项都留空则不改名；裂变后每条节点的名称还能在下面单独改。
+                示例：前缀填「裂变」、地区填「日本」→ 裂变|日本|Argo丨Xray丨xhttp_h2。两项都留空则不改名；裂变后每条节点的名称还能在下面单独改。
             </p>
             <button
                 type="button"

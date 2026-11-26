@@ -331,7 +331,7 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
         <div className="bg-white dark:bg-gray-800 shadow-md rounded-lg p-6 mb-8">
             <div className="flex items-center gap-3 mb-4">
                 <ListFilter className="w-7 h-7 text-purple-500" />
-                <h2 className="text-2xl font-semibold text-gray-700 dark:text-gray-200">IP/域名优选测速结果</h2>
+                <h2 className="text-2xl font-semibold text-gray-700 dark:text-gray-200">扫描结果</h2>
             </div>
             <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">仅展示本地后端回传的达标结果：延迟 3 次取最好一次 ≤ 延迟上限，且丢包 ≤ 丢包上限。</p>
             {scanResults.length > 0 ? (

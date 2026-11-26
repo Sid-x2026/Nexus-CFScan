@@ -62,8 +62,8 @@ const FISSION_RE = /^([a-zA-Z0-9+.-]+:\/\/[^@]+@)([^:/?#]+)(:\d+.*)$/;
 
 /** 一条链接裂变：只换 host；addr 可带端口（1.2.3.4:2053），带了就连端口一起换，
  *  不带沿用原生链接的端口。namePrefix 有值时加到备注最前面（裂变|日本|原备注），
- *  suffix 有值时追加到备注后面（原备注丨HKG 60ms）。 */
-export function fissionLink(link: string, addr: string, suffix?: string, namePrefix?: string): string | null {
+ *  除此之外备注原样保留，不再追加机房、延迟等后缀。 */
+export function fissionLink(link: string, addr: string, namePrefix?: string): string | null {
     const m = FISSION_RE.exec(link);
     if (!m) return null;
     let host = addr;
@@ -76,7 +76,7 @@ export function fissionLink(link: string, addr: string, suffix?: string, namePre
     let rest = m[3]; // :原生端口 + 后面（查询串 / 备注）
     if (port) rest = ':' + port + rest.replace(/^:\d+/, '');
     let out = m[1] + host + rest;
-    if (suffix || namePrefix) {
+    if (namePrefix) {
         const hashIdx = out.indexOf('#');
         if (hashIdx >= 0) {
             let frag = out.slice(hashIdx + 1);
@@ -85,23 +85,17 @@ export function fissionLink(link: string, addr: string, suffix?: string, namePre
             } catch {
                 // 备注不是合法百分号编码，原样保留
             }
-            let newFrag = frag;
-            if (namePrefix) newFrag = namePrefix + '|' + newFrag;
-            if (suffix) newFrag = newFrag + '丨' + suffix;
-            out = out.slice(0, hashIdx + 1) + newFrag;
+            out = out.slice(0, hashIdx + 1) + namePrefix + '|' + frag;
         } else {
-            const parts = [namePrefix, suffix].filter(Boolean);
-            out = out + '#' + parts.join('丨');
+            out = out + '#' + namePrefix;
         }
     }
     return out;
 }
 
 export interface FissionAddr {
-    /** 裂变用的地址：域名源用解析出的实际 IP，其余用 IP 本身 */
+    /** 裂变用的地址：域名源用解析出的实际 IP，其余用 IP 本身；可带端口 */
     addr: string;
-    /** 追加到备注的后缀，如 "HKG 60ms"；没有机房信息时用 IP 本身 */
-    suffix: string;
 }
 
 /** 按备注第一段区分：直连节点原样跟上，不裂变；其余按隧道节点裂变。 */
@@ -156,7 +150,7 @@ export function fissionLinks(
     if (mode === 'all') {
         for (const link of argoLinks) {
             for (const a of addrs) {
-                const f = fissionLink(link, a.addr, a.suffix, namePrefix);
+                const f = fissionLink(link, a.addr, namePrefix);
                 if (f) fissioned.push(f);
             }
         }
@@ -168,7 +162,7 @@ export function fissionLinks(
                 fissioned.push(link);
                 return;
             }
-            const f = fissionLink(link, a.addr, a.suffix, namePrefix);
+            const f = fissionLink(link, a.addr, namePrefix);
             if (f) fissioned.push(f);
         });
     }
@@ -211,7 +205,7 @@ export function parseCustomAddrs(text: string): CustomAddrResult {
             truncated = true;
             continue;
         }
-        addrs.push({ addr: line, suffix: line.split(':')[0] });
+        addrs.push({ addr: line });
     }
     return { addrs, invalid, truncated };
 }

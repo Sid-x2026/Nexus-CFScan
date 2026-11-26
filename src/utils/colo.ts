@@ -1,5 +1,4 @@
 // Cloudflare colo 代码到地区名称的映射表
-// NOTE: 后端 functions/api/getips.ts 有一份同样的副本，修改时请同步更新
 export const coloMap: { [key: string]: string } = {
     'SJC': '🇺🇸 圣何塞', 'LAX': '🇺🇸 洛杉矶', 'SEA': '🇺🇸 西雅图', 'SFO': '🇺🇸 旧金山', 'DFW': '🇺🇸 达拉斯',
     'ORD': '🇺🇸 芝加哥', 'IAD': '🇺🇸 华盛顿', 'ATL': '🇺🇸 亚特兰大', 'MIA': '🇺🇸 迈阿密', 'DEN': '🇺🇸 丹佛',

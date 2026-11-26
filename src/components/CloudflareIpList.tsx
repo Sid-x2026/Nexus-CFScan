@@ -67,7 +67,7 @@ export function CloudflareIpList({ onDataLoaded }: CloudflareIpListProps) {
         <div className="bg-white dark:bg-gray-800 shadow-md rounded-lg p-6 mb-8">
             <div className="flex items-center gap-4 mb-6">
                 <Cloud className="w-7 h-7 text-blue-500" />
-                <h2 className="text-2xl font-semibold text-gray-700 dark:text-gray-200">IP段</h2>
+                <h2 className="text-2xl font-semibold text-gray-700 dark:text-gray-200">IP 段库</h2>
                 <button
                     onClick={handleSync}
                     disabled={loading}
