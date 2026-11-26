@@ -123,6 +123,13 @@ export async function getSceneResults(name: string): Promise<ScanResult[]> {
     return handleResponse<ScanResult[]>(await authedFetch(`/api/results?scene=${encodeURIComponent(name)}&t=${Date.now()}`));
 }
 
+export async function deleteScene(name: string): Promise<void> {
+    const response = await authedFetch(`/api/results?scene=${encodeURIComponent(name)}`, {
+        method: 'DELETE',
+    });
+    return handleResponse<void>(response);
+}
+
 export async function login(password: string): Promise<{ success: boolean; message?: string; token?: string; apiToken?: string }> {
     try {
         const response = await fetch('/api/login', {
