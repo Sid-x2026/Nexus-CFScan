@@ -603,19 +603,22 @@ export function SavedIpList() {
             return;
         }
         const keys = new Set(targets.map((it) => itemKey(it)));
-        setItems((prev) => prev.map((it) => keys.has(itemKey(it)) ? { ...it, latency: 0, latencies: [], lossPct: 0, jitterMs: 0, speedMbps: 0 } : it));
         setRowTests((prev) => {
             const next = { ...prev };
             for (const k of keys) if (next[k]) next[k] = { ...next[k], probe: undefined, latency: undefined, speed: undefined };
             return next;
         });
-        for (const item of targets) {
-            const k = itemKey(item);
-            latencyUpdates.current[k] = { latency: 0, latencies: [], lossPct: 0, jitterMs: 0 };
-            speedUpdates.current[k] = { speedMbps: 0 };
+        // 一次写回：延迟和速度一起清、一起存。之前是先存延迟再存速度，
+        // 两次都读的同一份旧列表，第二次会把第一次清掉的延迟又写回去，所以延迟会恢复。
+        const nextItems = items.map((it) => keys.has(itemKey(it)) ? { ...it, latency: 0, latencies: [], lossPct: 0, jitterMs: 0, speedMbps: 0 } : it);
+        setItems(nextItems);
+        latencyUpdates.current = {};
+        speedUpdates.current = {};
+        const scenes = new Set(targets.map((it) => it.sceneName));
+        for (const scene of scenes) {
+            const sceneItems = nextItems.filter((i) => i.sceneName === scene).map(({ sceneName, ...rest }) => rest);
+            await saveResults(scene, sceneItems as ScanResult[], 'overwrite');
         }
-        await persistLatencyUpdates();
-        await persistSpeedUpdates();
         showToast(`已清零：共 ${targets.length} 个`, 'success');
     };
 
