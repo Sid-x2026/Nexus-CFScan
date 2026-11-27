@@ -12,10 +12,14 @@ import QRCode from 'qrcode';
 import { Split, Copy, Download, Zap, QrCode, X, Link2 } from 'lucide-react';
 
 const NATIVE_KEY = 'CF_FISSION_NATIVE';
+/** 原节点本地自定义保存：一份名字对应一份原节点内容，存在浏览器本地 */
+const NATIVE_SAVED_KEY = 'CF_FISSION_NATIVE_SAVED';
 const SCENE_KEY = 'CF_FISSION_SCENE';
 const CUSTOM_KEY = 'CF_FISSION_CUSTOM';
 const NAME_PREFIX_KEY = 'CF_FISSION_NAME_PREFIX';
 const NAME_REGION_KEY = 'CF_FISSION_NAME_REGION';
+const FISSION_LATENCY_MAX_KEY = 'CF_FISSION_LATENCY_MAX';
+const FISSION_SPEED_MIN_KEY = 'CF_FISSION_SPEED_MIN';
 /** 一次裂变最多生成的节点数，防止误选几十个 IP 把订阅撑爆 */
 const MAX_FISSION_LINKS = 200;
 
@@ -49,7 +53,21 @@ export function FissionSubscription() {
     // 裂变对象：已保存场景 / 自定义输入
     const [source, setSource] = useState<'scene' | 'custom'>('scene');
     const [customText, setCustomText] = useState(() => loadStored(CUSTOM_KEY, ''));
-    const [native, setNative] = useState(() => loadStored(NATIVE_KEY, ''));
+    // 安全：打开不显示上次的原节点/订阅，空白开始；以前存在浏览器里的上次原节点这次一并清掉。
+    // 想复用就存在下面的自定义保存里（比如 VPSA），用的时候自己选出来读。
+    const [native, setNative] = useState('');
+    /** 原节点自定义保存：名字 → 原节点内容；选一个就直接读进原节点框 */
+    const [savedNatives, setSavedNatives] = useState<Record<string, string>>(() => {
+        try {
+            const raw = localStorage.getItem(NATIVE_SAVED_KEY);
+            return raw ? (JSON.parse(raw) as Record<string, string>) : {};
+        } catch { return {}; }
+    });
+    const [selectedSavedName, setSelectedSavedName] = useState('');
+    const [newSaveName, setNewSaveName] = useState('');
+    /** 裂变筛选：延迟 ≤ X ms，速度 ≥ Y MB/s（没测过速度的按 0 算）；留空为不过滤 */
+    const [latencyMax, setLatencyMax] = useState(() => loadStored(FISSION_LATENCY_MAX_KEY, ''));
+    const [speedMin, setSpeedMin] = useState(() => loadStored(FISSION_SPEED_MIN_KEY, ''));
     // 原协议也可以用订阅链接拉取
     const [subLink, setSubLink] = useState('');
     const [fetchingSub, setFetchingSub] = useState(false);
@@ -72,6 +90,13 @@ export function FissionSubscription() {
         () => [...items].sort((a, b) => a.latency - b.latency),
         [items],
     );
+    /** 裂变筛选后的地址：延迟 ≤ 上限、速度 ≥ 下限（没测过速度的按 0 算）；留空为不过滤 */
+    const latencyMaxNum = /^\d+$/.test(latencyMax.trim()) ? parseInt(latencyMax.trim(), 10) : null;
+    const speedMinNum = /^\d+(\.\d+)?$/.test(speedMin.trim()) ? parseFloat(speedMin.trim()) : null;
+    const filteredItems = useMemo(() => sortedItems.filter((r) =>
+        (latencyMaxNum === null || (r.latency >= 0 && r.latency <= latencyMaxNum)) &&
+        (speedMinNum === null || (r.speedMbps ?? 0) >= speedMinNum),
+    ), [sortedItems, latencyMaxNum, speedMinNum]);
 
     const loadSceneItems = async (name: string) => {
         setLoading(true);
@@ -89,20 +114,38 @@ export function FissionSubscription() {
         }
     };
 
+    /** 重新拉场景列表：上面保存/删场景后不用手动刷新页面，这里也会跟着更新 */
+    const reloadScenes = async () => {
+        try {
+            const data = await getScenes();
+            const names = data.map((s) => s.name);
+            setScenes(names);
+            // 当前场景以浏览器里记的为准，还在就别乱跳；没了才切到第一个
+            let current = loadStored(SCENE_KEY, '');
+            if (!current || !names.includes(current)) current = names[0] || '';
+            if (current) {
+                setScene(current);
+                saveStored(SCENE_KEY, current);
+                void loadSceneItems(current);
+            } else {
+                setScene('');
+                setItems([]);
+                setChecked(new Set());
+            }
+        } catch (e) {
+            console.error('Failed to load scenes', e);
+        }
+    };
+
     useEffect(() => {
-        getScenes()
-            .then((data) => {
-                const names = data.map((s) => s.name);
-                setScenes(names);
-                let initial = loadStored(SCENE_KEY, '');
-                if (!initial || !names.includes(initial)) initial = names[0] || '';
-                if (initial) {
-                    setScene(initial);
-                    void loadSceneItems(initial);
-                }
-            })
-            .catch((e) => console.error('Failed to load scenes', e));
-        // 只在挂载时加载一次场景列表
+        // 安全：清掉以前存在浏览器里的上次原节点，打开就是空白
+        try { localStorage.removeItem(NATIVE_KEY); } catch { /* 忽略 */ }
+        void reloadScenes();
+        // 上面保存新场景、已保存库删场景时都会发这个事件，裂变下拉跟着刷新
+        const handler = () => { void reloadScenes(); };
+        window.addEventListener('cf:scenes-changed', handler);
+        return () => window.removeEventListener('cf:scenes-changed', handler);
+        // 只在挂载时加载一次场景列表，之后靠事件和下拉获得焦点时刷新
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
@@ -126,17 +169,17 @@ export function FissionSubscription() {
     /** 自定义输入的解析结果（一行一个 IP 或域名，可带端口） */
     const customParsed = useMemo(() => parseCustomAddrs(customText), [customText]);
 
-    /** 本次裂变的优选地址：场景模式用勾选的 IP（按延迟从低到高），自定义模式用输入的地址 */
+    /** 本次裂变的优选地址：场景模式用勾选的 IP（按延迟从低到高，筛选后才算），自定义模式用输入的地址 */
     const selectedAddrs: FissionAddr[] = useMemo(() => {
         if (source === 'custom') return customParsed.addrs;
-        return sortedItems
+        return filteredItems
             .filter((r) => checked.has(itemKey(r)))
             .map((r) => ({
                 // 域名源用解析出的实际 IP，其余用 IP 本身；端口直接用保存的端口，
                 // 裂变时连端口一起换，不用再手动改
                 addr: (r.resolvedIp || r.ip) + (r.port ? `:${r.port}` : ''),
             }));
-    }, [source, customParsed, sortedItems, checked]);
+    }, [source, customParsed, filteredItems, checked]);
 
     /** 原协议支持两种给法：粘贴订阅链接拉取，或直接粘贴节点完整信息 */
     const handleFetchSub = async () => {
@@ -153,7 +196,6 @@ export function FissionSubscription() {
             const links = decodeSubscription(text);
             if (links.length === 0) throw new Error('拉到了内容，但里面没有可识别的节点链接');
             setNative(text);
-            saveStored(NATIVE_KEY, text);
             showToast(`已拉取原协议订阅，共 ${links.length} 条节点`, 'success');
         } catch (e) {
             console.error('Failed to fetch subscription', e);
@@ -188,7 +230,6 @@ export function FissionSubscription() {
             showToast(`裂变后会超过 ${MAX_FISSION_LINKS} 条节点，请减少优选地址或改用「每协议 1 个 IP」`, 'warning');
             return;
         }
-        saveStored(NATIVE_KEY, native);
         // 命名：前缀|地区|原协议名称，如 裂变|日本|Argo丨Xray丨xhttp_h2；都留空则不改名
         const prefix = [namePrefix.trim(), nameRegion.trim()].filter(Boolean).join('|') || undefined;
         const r = fissionLinks(nativeLinks, selectedAddrs, mode, prefix);
@@ -288,6 +329,40 @@ export function FissionSubscription() {
         }
     };
 
+    /** 原节点自定义保存：把当前原节点框里的内容按名字存到浏览器本地（比如 VPSA） */
+    const handleSaveNative = () => {
+        const name = newSaveName.trim();
+        if (!name) {
+            showToast('请先给这份原节点起个名字，比如 VPSA', 'warning');
+            return;
+        }
+        if (!native.trim()) {
+            showToast('原节点框里是空的，没什么可存的', 'warning');
+            return;
+        }
+        const next = { ...savedNatives, [name]: native };
+        setSavedNatives(next);
+        try { localStorage.setItem(NATIVE_SAVED_KEY, JSON.stringify(next)); } catch { /* 忽略 */ }
+        setSelectedSavedName(name);
+        setNewSaveName('');
+        showToast(`原节点已保存为「${name}」`, 'success');
+    };
+
+    const handleDeleteSavedNative = () => {
+        if (!selectedSavedName) return;
+        const next = { ...savedNatives };
+        delete next[selectedSavedName];
+        setSavedNatives(next);
+        try { localStorage.setItem(NATIVE_SAVED_KEY, JSON.stringify(next)); } catch { /* 忽略 */ }
+        showToast(`已删除保存的原节点「${selectedSavedName}」`, 'success');
+        setSelectedSavedName('');
+    };
+
+    const handleSelectSavedNative = (name: string) => {
+        setSelectedSavedName(name);
+        if (name && savedNatives[name] !== undefined) setNative(savedNatives[name]);
+    };
+
     /** 生成二维码：先用 M 级容错，放不下再降到 L 级；还放不下就提示改用复制 */
     const openQr = async (label: string, content: string) => {
         if (!content) {
@@ -352,6 +427,8 @@ export function FissionSubscription() {
                         <select
                             value={scene}
                             onChange={(e) => handleSceneChange(e.target.value)}
+                            onFocus={() => void reloadScenes()}
+                            title="点开时自动刷新一次，上面刚保存的场景不用刷新页面也有"
                             className="p-2 border rounded-md dark:bg-gray-600 dark:border-gray-500 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none"
                         >
                             {scenes.length === 0 && <option value="">暂无已保存场景</option>}
@@ -360,16 +437,41 @@ export function FissionSubscription() {
                             ))}
                         </select>
                         <span className="text-sm text-gray-500 dark:text-gray-400">已勾选 {selectedAddrs.length} 个</span>
+                        <span className="flex items-center gap-1 text-xs font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap" title="只留延迟不超过该值的 IP">
+                            延迟 ≤
+                            <input
+                                type="text"
+                                inputMode="numeric"
+                                value={latencyMax}
+                                placeholder="不限"
+                                onChange={(e) => {
+                                    const v = e.target.value.replace(/[^\d]/g, '').slice(0, 5);
+                                    setLatencyMax(v);
+                                    saveStored(FISSION_LATENCY_MAX_KEY, v);
+                                }}
+                                className="w-16 px-2 py-1 text-xs font-medium text-gray-700 bg-white border border-gray-200 rounded-full text-center dark:bg-gray-800 dark:text-gray-200 dark:border-gray-600 outline-none focus:border-indigo-400"
+                            />
+                            ms
+                        </span>
+                        <span className="flex items-center gap-1 text-xs font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap" title="只留下载速度不低于该值的 IP，没测过速度的按 0 算">
+                            速度 ≥
+                            <input
+                                type="text"
+                                inputMode="decimal"
+                                value={speedMin}
+                                placeholder="不限"
+                                onChange={(e) => {
+                                    const v = e.target.value.replace(/[^\d.]/g, '').replace(/(\..*)\./g, '$1').slice(0, 6);
+                                    setSpeedMin(v);
+                                    saveStored(FISSION_SPEED_MIN_KEY, v);
+                                }}
+                                className="w-16 px-2 py-1 text-xs font-medium text-gray-700 bg-white border border-gray-200 rounded-full text-center dark:bg-gray-800 dark:text-gray-200 dark:border-gray-600 outline-none focus:border-indigo-400"
+                            />
+                            MB/s
+                        </span>
                         <button
                             type="button"
-                            onClick={() => setChecked(new Set(sortedItems.slice(0, 6).map(itemKey)))}
-                            className="px-3 py-1 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors"
-                        >
-                            取延迟最低 6 个
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => setChecked(new Set(sortedItems.map(itemKey)))}
+                            onClick={() => setChecked(new Set(filteredItems.map(itemKey)))}
                             className="px-3 py-1 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors"
                         >
                             全选
@@ -387,6 +489,8 @@ export function FissionSubscription() {
                             <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-6">加载中…</p>
                         ) : sortedItems.length === 0 ? (
                             <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-6">这个场景里没有已保存的 IP，请先去上面扫描并保存</p>
+                        ) : filteredItems.length === 0 ? (
+                            <p className="text-sm text-gray-500 dark:text-gray-400 text-center py-6">没有符合筛选条件的 IP，放宽延迟或速度再试</p>
                         ) : (
                             <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
                                 <thead className="bg-gray-50 dark:bg-gray-700 sticky top-0 z-10">
@@ -397,10 +501,11 @@ export function FissionSubscription() {
                                         <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300">机房</th>
                                         <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300">延迟</th>
                                         <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300">丢包</th>
+                                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300">下载速度</th>
                                     </tr>
                                 </thead>
                                 <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                                    {sortedItems.map((r) => {
+                                    {filteredItems.map((r) => {
                                         const key = itemKey(r);
                                         return (
                                             <tr key={key} className="hover:bg-gray-50 dark:hover:bg-gray-700">
@@ -417,6 +522,7 @@ export function FissionSubscription() {
                                                 <td className="px-4 py-2 text-sm text-gray-700 dark:text-gray-200">{r.colo ? `${r.colo} ${getColoName(r.colo)}` : '-'}</td>
                                                 <td className="px-4 py-2 text-sm text-gray-700 dark:text-gray-200">{r.latency}ms</td>
                                                 <td className="px-4 py-2 text-sm text-gray-700 dark:text-gray-200">{r.lossPct !== undefined ? `${r.lossPct}%` : '-'}</td>
+                                                <td className="px-4 py-2 text-sm text-gray-700 dark:text-gray-200">{(r.speedMbps ?? 0).toFixed(1)} MB/s</td>
                                             </tr>
                                         );
                                     })}
@@ -452,6 +558,43 @@ export function FissionSubscription() {
 
             {/* ② 原协议节点（裂变对象） */}
             <h3 className="text-lg font-semibold text-gray-700 dark:text-gray-200 mb-3">② 原协议节点</h3>
+            <div className="flex flex-wrap items-center gap-2 mb-2">
+                <select
+                    value={selectedSavedName}
+                    onChange={(e) => handleSelectSavedNative(e.target.value)}
+                    title="选一份本地保存的原节点，直接读进下面框里"
+                    className="p-2 border rounded-md dark:bg-gray-600 dark:border-gray-500 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none"
+                >
+                    <option value="">本地保存的原节点…</option>
+                    {Object.keys(savedNatives).map((name) => (
+                        <option key={name} value={name}>{name}</option>
+                    ))}
+                </select>
+                <input
+                    type="text"
+                    value={newSaveName}
+                    onChange={(e) => setNewSaveName(e.target.value)}
+                    placeholder="起个名字保存，比如 VPSA"
+                    className="w-44 p-2 border rounded-md text-sm dark:bg-gray-600 dark:border-gray-500 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none"
+                />
+                <button
+                    type="button"
+                    onClick={handleSaveNative}
+                    disabled={!native.trim() || !newSaveName.trim()}
+                    className="px-3 py-2 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                    保存当前原节点
+                </button>
+                {selectedSavedName && (
+                    <button
+                        type="button"
+                        onClick={handleDeleteSavedNative}
+                        className="px-3 py-2 text-xs font-medium text-red-800 bg-red-100 rounded-full hover:bg-red-200 dark:bg-red-900 dark:text-red-300 dark:hover:bg-red-800 transition-colors"
+                    >
+                        删除「{selectedSavedName}」
+                    </button>
+                )}
+            </div>
             <div className="flex gap-2 mb-2">
                 <input
                     type="text"
@@ -474,16 +617,13 @@ export function FissionSubscription() {
             </div>
             <textarea
                 value={native}
-                onChange={(e) => {
-                    setNative(e.target.value);
-                    saveStored(NATIVE_KEY, e.target.value);
-                }}
+                onChange={(e) => setNative(e.target.value)}
                 rows={4}
                 placeholder="或者直接粘贴节点完整信息：明文链接（一行一条）或 base64 订阅内容。6 条 Argo 隧道链接会被裂变，直连链接原样保留。"
                 className="w-full p-3 border rounded-md font-mono text-sm dark:bg-gray-600 dark:border-gray-500 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none mb-2"
             />
             <p className="text-xs text-gray-500 dark:text-gray-400 mb-6">
-                两种给法都行：上面填订阅链接点拉取，或下面直接粘贴节点。只存在浏览器本地，下次打开不用再贴。节点名称只按命名规则来：前缀|地区|原协议名称，不再追加机房、延迟。场景模式用每个 IP 保存的端口，自定义输入里写了端口的也按写的来。
+                两种给法都行：上面填订阅链接点拉取，或下面直接粘贴节点。打开时这里是空的，不显示上次的节点；想复用就按名字存到浏览器本地，用的时候在上面选出来，只填裂变 IP 就能生成。节点名称只按命名规则来：前缀|地区|原协议名称，不再追加机房、延迟。场景模式用每个 IP 保存的端口，自定义输入里写了端口的也按写的来。
             </p>
 
             {/* ③ 分配方式 + 节点命名 */}

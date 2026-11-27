@@ -41,6 +41,8 @@ export function SavedIpList() {
     const [loading, setLoading] = useState(false);
     const [selectedScenes, setSelectedScenes] = useState<Set<string>>(new Set());
     const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
+    /** 场景管理面板是否展开：列出每个场景的名字和个数，可直接删除场景 */
+    const [showSceneManage, setShowSceneManage] = useState(false);
     /** 地区筛选：下拉选一个机房代码（NRT/HKG/ICN…），只看该地区的 IP；'all' 为全部 */
     const [selectedRegion, setSelectedRegion] = useState<string>('all');
     /** 表头排序：点一下按该列升序，再点一下降序；默认按延迟升序（和原来一致） */
@@ -491,14 +493,14 @@ export function SavedIpList() {
         ? filteredBySceneRegion
         : filteredBySceneRegion.filter(i => i.latency >= 0 && i.latency <= latencyMaxNum);
     const latencyHiddenCount = filteredBySceneRegion.length - filteredByLatency.length;
-    /** 下载速度下限：只留速度 ≥ 下限的；没测过速度的不算达标，也隐藏 */
+    /** 下载速度下限：没测过速度的按 0 算，速度 ≥ 下限才留；下限 > 0 时没测过的自然被隐藏 */
     const filteredItems = speedMinNum === null
         ? filteredByLatency
-        : filteredByLatency.filter(i => i.speedMbps !== undefined && i.speedMbps >= speedMinNum);
+        : filteredByLatency.filter(i => (i.speedMbps ?? 0) >= speedMinNum);
     const speedHiddenCount = filteredByLatency.length - filteredItems.length;
     /** 丢包显示取一位小数：33.33333333333333% → 33.3%，整数保持原样 */
     const lossText = (v?: number) => v === undefined ? '' : (Number.isInteger(v) ? String(v) : v.toFixed(1));
-    /** 表头排序：没数据的（丢包/抖动/速度留空）永远排最后，不参与方向翻转 */
+    /** 表头排序：没数据的（丢包/抖动留空）永远排最后，不参与方向翻转；下载速度没测过的按 0 算，当最慢的 */
     const cmpOptNum = (a?: number, b?: number) => {
         if (a === undefined && b === undefined) return 0;
         if (a === undefined) return 1;
@@ -513,7 +515,7 @@ export function SavedIpList() {
             case 'latency': return dir * (a.latency - b.latency);
             case 'lossPct': return dir * cmpOptNum(a.lossPct, b.lossPct);
             case 'jitterMs': return dir * cmpOptNum(a.jitterMs, b.jitterMs);
-            case 'speedMbps': return dir * cmpOptNum(a.speedMbps, b.speedMbps);
+            case 'speedMbps': return dir * ((a.speedMbps ?? 0) - (b.speedMbps ?? 0));
             case 'colo': return dir * (a.colo || '').localeCompare(b.colo || '');
             case 'scene': return dir * a.sceneName.localeCompare(b.sceneName);
             default: return 0;
@@ -537,11 +539,17 @@ export function SavedIpList() {
         setSelectedItems(newSet);
     };
 
-    /** 场景全选/反选：选中的取消，没选的选上 */
-    const handleToggleAllScenes = () => {
-        setSelectedScenes(prev => {
-            const next = new Set<string>();
-            for (const s of uniqueScenes) if (!prev.has(s)) next.add(s);
+    /** 行全选/反选：对当前可见行勾选取反——全勾了就全取消，没全勾就全勾上（以前是切场景显隐，不对） */
+    const handleToggleAllItems = () => {
+        const visibleIds = filteredItems.map((item) => itemKey(item));
+        const allChecked = visibleIds.length > 0 && visibleIds.every((id) => selectedItems.has(id));
+        setSelectedItems((prev) => {
+            const next = new Set(prev);
+            if (allChecked) {
+                for (const id of visibleIds) next.delete(id);
+            } else {
+                for (const id of visibleIds) next.add(id);
+            }
             return next;
         });
     };
@@ -586,6 +594,7 @@ export function SavedIpList() {
             }
             setSelectedItems(new Set());
             await loadData();
+            try { window.dispatchEvent(new CustomEvent('cf:scenes-changed')); } catch { /* 忽略 */ }
         } catch (e) {
             showToast('删除失败', 'error');
             setLoading(false);
@@ -610,6 +619,8 @@ export function SavedIpList() {
             });
             showToast(`场景「${scene}」已删除`, 'success');
             await loadData();
+            // 通知裂变订阅刷新场景下拉，不用手动刷新页面
+            try { window.dispatchEvent(new CustomEvent('cf:scenes-changed')); } catch { /* 忽略 */ }
         } catch (e) {
             showToast('删除场景失败', 'error');
             setLoading(false);
@@ -632,7 +643,7 @@ export function SavedIpList() {
                 item.latency,
                 item.lossPct !== undefined ? lossText(item.lossPct) : '',
                 item.jitterMs !== undefined ? item.jitterMs : '',
-                item.speedMbps !== undefined ? item.speedMbps.toFixed(1) : '',
+                (item.speedMbps ?? 0).toFixed(1),
                 item.source ? SOURCE_LABELS[item.source] : '',
                 item.colo || '',
                 getColoName(item.colo || ''),
@@ -674,7 +685,7 @@ export function SavedIpList() {
                     item.source ? SOURCE_LABELS[item.source] : '',
                     item.lossPct !== undefined ? `丢包${lossText(item.lossPct)}%` : '',
                     item.jitterMs !== undefined ? `抖动${item.jitterMs}ms` : '',
-                    item.speedMbps !== undefined ? `速度${item.speedMbps.toFixed(1)}MB/s` : '',
+                    `速度${(item.speedMbps ?? 0).toFixed(1)}MB/s`,
                 ].filter(Boolean).join('|');
                 const comment = [regionName, sceneName, latency, extra].filter(Boolean).join('|');
                 txtContent += `${item.ip}:${item.port}#${comment}\n`;
@@ -711,7 +722,7 @@ export function SavedIpList() {
                 item.source ? SOURCE_LABELS[item.source] : '',
                 item.lossPct !== undefined ? `丢包${lossText(item.lossPct)}%` : '',
                 item.jitterMs !== undefined ? `抖动${item.jitterMs}ms` : '',
-                item.speedMbps !== undefined ? `速度${item.speedMbps.toFixed(1)}MB/s` : '',
+                `速度${(item.speedMbps ?? 0).toFixed(1)}MB/s`,
             ].filter(Boolean).join('|');
             const comment = [regionName, sceneName, latency, extra].filter(Boolean).join('|');
             txtContent += `${item.ip}:${item.port}#${comment}\n`;
@@ -830,7 +841,7 @@ export function SavedIpList() {
                                 <span className="text-gray-400 dark:text-gray-500 font-normal">已隐藏 {latencyHiddenCount} 个</span>
                             )}
                         </span>
-                        <span className="flex items-center gap-1 text-xs font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap ml-2" title="只显示下载速度不低于该值的 IP，没测过速度的不显示；留空为全部显示">
+                        <span className="flex items-center gap-1 text-xs font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap ml-2" title="只显示下载速度不低于该值的 IP，没测过速度的按 0 算；留空为全部显示">
                             速度 ≥
                             <input
                                 type="text"
@@ -849,35 +860,47 @@ export function SavedIpList() {
                                 <span className="text-gray-400 dark:text-gray-500 font-normal">已隐藏 {speedHiddenCount} 个</span>
                             )}
                         </span>
-                        {/* 左边：选场景 / 删选中；右边：批量测试 / 刷新 */}
+                        {/* 场景过滤行只留场景清空和场景管理；行勾选/删除移到下面第二行 */}
                         <div className="flex flex-wrap items-center gap-2">
                             <button
                                 type="button"
-                                onClick={handleToggleAllScenes}
-                                title="反选场景：选中的取消，没选的选上"
-                                className="px-3 py-1 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors"
-                            >
-                                全选/反选
-                            </button>
-                            <button
-                                type="button"
                                 onClick={() => setSelectedScenes(new Set())}
+                                title="取消全部场景的显示"
                                 className="px-3 py-1 text-xs font-medium text-gray-800 bg-gray-100 rounded-full hover:bg-gray-200 dark:bg-gray-600 dark:text-gray-300 dark:hover:bg-gray-500 transition-colors"
                             >
                                 清空
                             </button>
-                            {selectedItems.size > 0 && (
-                                <button
-                                    onClick={handleDeleteSelected}
-                                    className="px-3 py-1 text-xs font-medium text-red-800 bg-red-100 rounded-full hover:bg-red-200 dark:bg-red-900 dark:text-red-300 dark:hover:bg-red-800 transition-colors"
-                                >
-                                    <Trash2 className="w-3.5 h-3.5 mr-1 inline-block" />
-                                    删除选中 ({selectedItems.size})
-                                </button>
-                            )}
+                            <button
+                                type="button"
+                                onClick={() => setShowSceneManage(v => !v)}
+                                title="列出全部场景，可删除自定义命名的场景"
+                                className="px-3 py-1 text-xs font-medium text-indigo-800 bg-indigo-100 rounded-full hover:bg-indigo-200 dark:bg-indigo-900 dark:text-indigo-300 dark:hover:bg-indigo-800 transition-colors"
+                            >
+                                场景管理
+                            </button>
                         </div>
-                        <div className="flex flex-wrap items-center gap-2 ml-auto">
-                            <span className="text-xs text-gray-500 dark:text-gray-400">已勾选 {selectedItems.size} 个</span>
+                        <div className="flex flex-wrap items-center gap-2 w-full justify-between border-t border-gray-200 dark:border-gray-600 pt-3 mt-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                                <button
+                                    type="button"
+                                    onClick={handleToggleAllItems}
+                                    title="对当前可见行勾选取反：全勾了就全取消，没全勾就全勾上"
+                                    className="px-3 py-1 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors"
+                                >
+                                    全选/反选
+                                </button>
+                                {selectedItems.size > 0 && (
+                                    <button
+                                        onClick={handleDeleteSelected}
+                                        className="px-3 py-1 text-xs font-medium text-red-800 bg-red-100 rounded-full hover:bg-red-200 dark:bg-red-900 dark:text-red-300 dark:hover:bg-red-800 transition-colors"
+                                    >
+                                        <Trash2 className="w-3.5 h-3.5 mr-1 inline-block" />
+                                        删除选中 ({selectedItems.size})
+                                    </button>
+                                )}
+                                <span className="text-xs text-gray-500 dark:text-gray-400">已勾选 {selectedItems.size} 个</span>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2">
                             {/* 批量测试：只测已勾选的行，探针/测延迟最多 4 个并发，测速 2 个并发 */}
                             <button
                                 type="button"
@@ -910,8 +933,47 @@ export function SavedIpList() {
                                 <RotateCw className="w-3.5 h-3.5 mr-1 inline-block" />
                                 刷新
                             </button>
+                            </div>
                         </div>
                 </div>
+
+            {/* 场景管理：列出全部场景和个数，可删除自定义命名的场景 */}
+            {showSceneManage && (
+                <div className="mb-4 p-3 bg-gray-50 dark:bg-gray-700 rounded-lg">
+                    <div className="flex items-center justify-between mb-2">
+                        <span className="text-sm font-medium text-gray-700 dark:text-gray-300">场景管理（共 {uniqueScenes.length} 个场景）</span>
+                        <button
+                            type="button"
+                            onClick={() => setShowSceneManage(false)}
+                            className="px-2 py-0.5 text-xs font-medium text-gray-600 bg-gray-100 rounded-full hover:bg-gray-200 dark:bg-gray-600 dark:text-gray-300 dark:hover:bg-gray-500 transition-colors"
+                        >
+                            收起
+                        </button>
+                    </div>
+                    {uniqueScenes.length === 0 ? (
+                        <p className="text-sm text-gray-500 dark:text-gray-400">暂无已保存场景</p>
+                    ) : (
+                        <div className="flex flex-wrap gap-2">
+                            {uniqueScenes.map((s) => {
+                                const count = items.filter((i) => i.sceneName === s).length;
+                                return (
+                                    <span key={s} className="inline-flex items-center gap-2 px-2.5 py-1 text-xs font-medium rounded-full bg-white text-gray-700 border border-gray-200 dark:bg-gray-800 dark:text-gray-200 dark:border-gray-600">
+                                        {s}（{count} 个）
+                                        <button
+                                            type="button"
+                                            title={`删除场景 ${s}`}
+                                            onClick={() => void handleDeleteScene(s)}
+                                            className="px-2 py-0.5 text-xs font-medium text-red-800 bg-red-100 rounded-full hover:bg-red-200 dark:bg-red-900 dark:text-red-300 dark:hover:bg-red-800 transition-colors"
+                                        >
+                                            删除
+                                        </button>
+                                    </span>
+                                );
+                            })}
+                        </div>
+                    )}
+                </div>
+            )}
 
             {/* 批量测试进度条：跑的时候才显示，跑完就消失；测延迟是 3 遍全量，第几遍也写出来 */}
             {batchKind !== null && batchTotal > 0 && (
@@ -1015,8 +1077,7 @@ export function SavedIpList() {
                                         {(() => {
                                             const t = rowTests[itemKey(item)];
                                             if (t?.testing === 'speed') return <span className="text-blue-600">测速中…</span>;
-                                            if (item.speedMbps !== undefined) return <span className="font-semibold text-blue-600">{item.speedMbps.toFixed(1)} MB/s</span>;
-                                            return '-';
+                                            return <span className="font-semibold text-blue-600">{(item.speedMbps ?? 0).toFixed(1)} MB/s</span>;
                                         })()}
                                     </td>
                                     <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{item.colo || '-'}</td>

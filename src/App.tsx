@@ -167,7 +167,7 @@ function App() {
 
           <SavedIpList key={refreshKey} />
 
-          <FissionSubscription />
+          <FissionSubscription key={refreshKey} />
 
         </main>
         

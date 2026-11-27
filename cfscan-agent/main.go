@@ -783,9 +783,12 @@ func handleSpeed(w http.ResponseWriter, r *http.Request) {
 	if secs <= 0 {
 		secs = 0.001
 	}
-	mbps := float64(n) * 8 / secs / 1e6
-	mbps = float64(int(mbps*100)) / 100
-	writeJSON(w, http.StatusOK, speedResp{OK: true, SpeedMbps: mbps, Bytes: n, ElapsedMs: elapsedMs})
+	// 下载速度按 MB/s 算：字节数 ÷ 秒数 ÷ 1e6。之前是 ×8 再除，算出来的是 Mbps，
+	// 前端却按 MB/s 显示，所以 118 Mbps 会显示成 118.0 MB/s。字段名 speedMbps 是旧名字，
+	// 实际值现在是 MB/s，前端按 MB/s 显示就对了。旧的已保存速度还是 Mbps 的数，重测一次就正过来。
+	mBps := float64(n) / secs / 1e6
+	mBps = float64(int(mBps*100)) / 100
+	writeJSON(w, http.StatusOK, speedResp{OK: true, SpeedMbps: mBps, Bytes: n, ElapsedMs: elapsedMs})
 }
 
 // ---------------------------------------------------------------------------

@@ -28,6 +28,9 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
     const [latencyFilterError, setLatencyFilterError] = useState<string>('');
     const [isSaving, setIsSaving] = useState(false);
     const [sceneName, setSceneName] = useState('');
+    /** 另存为：把这次重刷的结果存到另一个自定义文件名里，不动原来那个场景 */
+    const [saveAsName, setSaveAsName] = useState('');
+    const [isSavingAs, setIsSavingAs] = useState(false);
     const [scenes, setScenes] = useState<string[]>([]);
     const [sceneDropdownOpen, setSceneDropdownOpen] = useState(false);
     const sceneInputRef = useRef<HTMLDivElement>(null);
@@ -318,11 +321,44 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
             await saveResults(sceneName.trim(), dataToSave as ScanResult[], saveMode);
             showToast(`场景 "${sceneName.trim()}" 保存成功！\n共 ${limitedResults.length} 个IP/域名\n模式: ${saveMode === 'overwrite' ? '覆盖' : '追加'}`, 'success');
             if (onSaveSuccess) onSaveSuccess();
+            try { window.dispatchEvent(new CustomEvent('cf:scenes-changed')); } catch { /* 忽略 */ }
         } catch (error) {
             console.error('Failed to save results:', error);
             showToast(`保存失败: ${error instanceof Error ? error.message : '未知错误'}`, 'error');
         } finally {
             setIsSaving(false);
+        }
+    };
+
+    /** 另存为：这次重刷的结果另存一个自定义文件名，原场景不动；新场景进场景管理 */
+    const handleSaveAs = async () => {
+        if (limitedResults.length === 0) {
+            showToast('没有可保存的结果。', 'warning');
+            return;
+        }
+        const name = saveAsName.trim();
+        if (!name) {
+            showToast('请先给另存为起个文件名，比如 CF-2', 'warning');
+            return;
+        }
+        if (name === sceneName.trim()) {
+            showToast('另存为的名字和当前场景一样，换个名字再存', 'warning');
+            return;
+        }
+        setIsSavingAs(true);
+        try {
+            const dataToSave = limitedResults.map(({ isAvailable, ...rest }) => rest);
+            await saveResults(name, dataToSave as ScanResult[], 'overwrite');
+            showToast(`已另存为场景 "${name}"，共 ${limitedResults.length} 个IP/域名`, 'success');
+            setScenes((prev) => (prev.includes(name) ? prev : [...prev, name]));
+            setSaveAsName('');
+            if (onSaveSuccess) onSaveSuccess();
+            try { window.dispatchEvent(new CustomEvent('cf:scenes-changed')); } catch { /* 忽略 */ }
+        } catch (error) {
+            console.error('Failed to save as:', error);
+            showToast(`另存为失败: ${error instanceof Error ? error.message : '未知错误'}`, 'error');
+        } finally {
+            setIsSavingAs(false);
         }
     };
 
@@ -722,6 +758,25 @@ export function ScannerResults({ scanResults, onSaveSuccess }: IpScannerResultsA
                             <Save className="w-4 h-4 mr-2" />
                             {isSaving ? '保存中...' : '保存'}
                         </button>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-3 mt-3 pt-3 border-t border-gray-200 dark:border-gray-600">
+                        <span className="text-sm font-medium text-gray-700 dark:text-gray-200">另存为：</span>
+                        <input
+                            type="text"
+                            value={saveAsName}
+                            onChange={(e) => setSaveAsName(e.target.value)}
+                            placeholder="另外一个文件名，比如 CF-2"
+                            className="p-2 border rounded-md w-64 dark:bg-gray-600 dark:border-gray-500 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none"
+                        />
+                        <button
+                            onClick={handleSaveAs}
+                            disabled={isSavingAs || limitedResults.length === 0 || !saveAsName.trim()}
+                            className="flex items-center bg-green-600 text-white font-bold py-2 px-6 rounded-md hover:bg-green-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed"
+                        >
+                            <Save className="w-4 h-4 mr-2" />
+                            {isSavingAs ? '另存中...' : '另存为新场景'}
+                        </button>
+                        <span className="text-xs text-gray-500 dark:text-gray-400">这次重刷的结果另存一个名字，原场景不动，新场景进已保存库的场景管理。</span>
                     </div>
                 </div>
                 </>
