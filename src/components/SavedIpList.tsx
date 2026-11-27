@@ -43,6 +43,9 @@ export function SavedIpList() {
     const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
     /** 场景管理面板是否展开：列出每个场景的名字和个数，可直接删除场景 */
     const [showSceneManage, setShowSceneManage] = useState(false);
+    /** 另存为：把勾选的 IP 另存成一个新场景名 */
+    const [saveAsName, setSaveAsName] = useState('');
+    const [isSavingAs, setIsSavingAs] = useState(false);
     /** 地区筛选：下拉选一个机房代码（NRT/HKG/ICN…），只看该地区的 IP；'all' 为全部 */
     const [selectedRegion, setSelectedRegion] = useState<string>('all');
     /** 表头排序：点一下按该列升序，再点一下降序；默认按延迟升序（和原来一致） */
@@ -627,6 +630,37 @@ export function SavedIpList() {
         }
     };
 
+    /** 另存为：场景里二次扫完，把勾选的好的 IP 单独存到另外一个自定义场景里，原场景不动 */
+    const handleSaveAsSelected = async () => {
+        const targets = items.filter((item) => selectedItems.has(itemKey(item)));
+        if (targets.length === 0) {
+            showToast('请先勾选要另存的 IP，二次扫完好的勾上再存', 'warning');
+            return;
+        }
+        const name = saveAsName.trim();
+        if (!name) {
+            showToast('请先给另存为起个场景名，比如 CF-2', 'warning');
+            return;
+        }
+        if (uniqueScenes.includes(name)) {
+            const ok = await confirm(`场景「${name}」已经有了，另存会覆盖它里面的内容，确定要覆盖吗？`, { confirmText: '确定覆盖' });
+            if (!ok) return;
+        }
+        setIsSavingAs(true);
+        try {
+            const dataToSave = targets.map(({ sceneName, ...rest }) => rest);
+            await saveResults(name, dataToSave as ScanResult[], 'overwrite');
+            showToast(`已另存为场景「${name}」，共 ${targets.length} 个IP/域名`, 'success');
+            setSaveAsName('');
+            await loadData();
+            try { window.dispatchEvent(new CustomEvent('cf:scenes-changed')); } catch { /* 忽略 */ }
+        } catch (e) {
+            showToast(`另存为失败: ${e instanceof Error ? e.message : '未知错误'}`, 'error');
+        } finally {
+            setIsSavingAs(false);
+        }
+    };
+
     const handleExportCsv = () => {
         if (filteredItemsSorted.length === 0) {
             showToast('没有可导出的数据', 'warning');
@@ -1119,7 +1153,8 @@ export function SavedIpList() {
                 </table>
 
             </div>
-            <div className="mt-8 flex justify-center gap-4">
+            <div className="mt-8 flex flex-col items-center gap-3">
+                <div className="flex justify-center gap-4">
                     <button onClick={handleExportCsv} className="flex items-center px-4 py-2 font-bold text-white bg-green-600 rounded hover:bg-green-700 transition-colors">
                         <File className="w-4 h-4 mr-2" />
                         导出 CSV
@@ -1132,6 +1167,25 @@ export function SavedIpList() {
                         <Copy className="w-4 h-4 mr-2" />
                         复制
                     </button>
+                </div>
+                <div className="flex flex-wrap items-center justify-center gap-3">
+                    <span className="text-sm font-medium text-gray-700 dark:text-gray-200">另存为：</span>
+                    <input
+                        type="text"
+                        value={saveAsName}
+                        onChange={(e) => setSaveAsName(e.target.value)}
+                        placeholder="另外一个场景名，比如 CF-2"
+                        className="p-2 border rounded-md w-64 text-sm dark:bg-gray-600 dark:border-gray-500 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none"
+                    />
+                    <button
+                        onClick={handleSaveAsSelected}
+                        disabled={isSavingAs || selectedItems.size === 0 || !saveAsName.trim()}
+                        className="flex items-center px-4 py-2 font-bold text-white bg-green-600 rounded hover:bg-green-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed"
+                    >
+                        {isSavingAs ? '另存中...' : `另存为新场景${selectedItems.size > 0 ? `（${selectedItems.size} 个）` : ''}`}
+                    </button>
+                    <span className="text-xs text-gray-500 dark:text-gray-400">场景里二次扫完，勾上好的 IP，另存到一个新场景，原场景不动，新场景进场景管理。</span>
+                </div>
             </div>
                 </>
             )}
