@@ -44,7 +44,7 @@ export function SavedIpList() {
     /** 地区筛选：下拉选一个机房代码（NRT/HKG/ICN…），只看该地区的 IP；'all' 为全部 */
     const [selectedRegion, setSelectedRegion] = useState<string>('all');
     /** 表头排序：点一下按该列升序，再点一下降序；默认按延迟升序（和原来一致） */
-    type SortKey = 'ip' | 'port' | 'latency' | 'lossPct' | 'jitterMs' | 'colo' | 'scene';
+    type SortKey = 'ip' | 'port' | 'latency' | 'lossPct' | 'jitterMs' | 'speedMbps' | 'colo' | 'scene';
     const [sortKey, setSortKey] = useState<SortKey>('latency');
     const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
     const toggleSort = (key: SortKey) => {
@@ -58,6 +58,10 @@ export function SavedIpList() {
     /** 延迟上限筛选：只显示延迟 ≤ 该值的 IP（高于该值的不显示）；留空为不过滤，值记在浏览器里 */
     const [latencyMax, setLatencyMax] = useState<string>(() => {
         try { return localStorage.getItem('CF_SAVED_LATENCY_MAX') || ''; } catch { return ''; }
+    });
+    /** 下载速度下限筛选：只显示速度 ≥ 该值的 IP；没测过速度的不算达标，也隐藏；值记在浏览器里 */
+    const [speedMin, setSpeedMin] = useState<string>(() => {
+        try { return localStorage.getItem('CF_SAVED_SPEED_MIN') || ''; } catch { return ''; }
     });
     // 已保存列表平时不常翻，支持收起；状态记在浏览器里，默认展开
     const [collapsed, setCollapsed] = useState(() => {
@@ -80,9 +84,13 @@ export function SavedIpList() {
     const [batchTotal, setBatchTotal] = useState(0);
     /** 本批测延迟攒下的新延迟：整批跑完一次性写回已保存数据，避免 4 并发各写各的互相覆盖 */
     const latencyUpdates = useRef<Record<string, { latency: number; latencies?: number[]; lossPct?: number; jitterMs?: number }>>({});
+    /** 本批测下载速度攒下的新速度：整批跑完一次性写回已保存数据（和测延迟同一套路，失败的行不更新） */
+    const speedUpdates = useRef<Record<string, { speedMbps: number }>>({});
     // 本地后端地址：首次测试时用 probeLocalAgent 自行探测并记住，
     // 与 ScannerConfig / ScannerResults 共用同一后端（默认 13335）。
     const [agentBase, setAgentBase] = useState<string | null>(null);
+
+    const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
     const itemKey = (item: FlatIpItem) => `${item.ip}:${item.port}#${item.sceneName}`;
 
@@ -173,6 +181,28 @@ export function SavedIpList() {
     };
 
     /**
+     * 本批测下载速度攒下的新速度一次性写回：更新列表里的速度，
+     * 再把涉及的场景整场景覆盖保存。失败的行不更新，留着旧值。
+     */
+    const persistSpeedUpdates = async (): Promise<number> => {
+        const updates = speedUpdates.current;
+        const keys = Object.keys(updates);
+        if (keys.length === 0) return 0;
+        speedUpdates.current = {};
+        const nextItems = items.map(it => {
+            const u = updates[itemKey(it)];
+            return u ? { ...it, speedMbps: u.speedMbps } : it;
+        });
+        setItems(nextItems);
+        const scenes = new Set(nextItems.filter(it => updates[itemKey(it)]).map(it => it.sceneName));
+        for (const scene of scenes) {
+            const sceneItems = nextItems.filter(i => i.sceneName === scene).map(({ sceneName, ...rest }) => rest);
+            await saveResults(scene, sceneItems as ScanResult[], 'overwrite');
+        }
+        return keys.length;
+    };
+
+    /**
      * 测其中一行（不触发整轮扫描；探针/测速只显示结果不改数据，
      * 测延迟成功后把新延迟攒起来，整批跑完一次性写回已保存数据并重排）。
      * 返回 false 表示后端正忙（409），调用方应停止整批；其它单条失败
@@ -202,8 +232,16 @@ export function SavedIpList() {
                     latencyUpdates.current[key] = { latency: res.latency, latencies: res.latencies, lossPct: res.lossPct, jitterMs: res.jitterMs };
                 }
             } else {
-                const res = await speedSingle(base, req);
+                let res = await speedSingle(base, req);
+                // 429 是测速端限流：等 5 秒再试一次，还 429 就把原因留给表内显示
+                if (!res.ok && res.error && /429/.test(res.error)) {
+                    await sleep(5000);
+                    res = await speedSingle(base, req);
+                }
                 setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: undefined, speed: res } }));
+                if (res.ok && res.speedMbps !== undefined) {
+                    speedUpdates.current[key] = { speedMbps: res.speedMbps };
+                }
             }
             return true;
         } catch (e) {
@@ -227,7 +265,7 @@ export function SavedIpList() {
         }
     };
 
-    /** 一键批量测试：只测已勾选且当前可见的行，最多 4 个并发 */
+    /** 一键批量测试：只测已勾选且当前可见的行；探针/测延迟最多 4 个并发，测速 2 个并发 */
     const runBatch = async (kind: 'probe' | 'speed' | 'latency', targets: FlatIpItem[]) => {
         if (batchKind) return;
         if (targets.length === 0) {
@@ -239,14 +277,18 @@ export function SavedIpList() {
         if (await checkBusy(base)) return;
         if (!(await checkEndpoint(base, kind === 'probe' ? '/probe' : kind === 'latency' ? '/latency' : '/speed'))) return;
         latencyUpdates.current = {};
+        speedUpdates.current = {};
         setBatchKind(kind);
         setBatchDone(0);
         setBatchTotal(targets.length);
         const busy = { value: false };
         let idx = 0;
+        // 测速降到 2 并发、每次开测间隔 500ms：一次几十个下载同时打过去，测速端会回 429 限流
+        const concurrency = kind === 'speed' ? 2 : 4;
         const worker = async () => {
             while (idx < targets.length && !busy.value) {
                 const item = targets[idx++];
+                if (kind === 'speed') await sleep(500);
                 const ok = await runSingleTest(item, kind, base);
                 if (!ok) {
                     busy.value = true;
@@ -256,7 +298,7 @@ export function SavedIpList() {
             }
         };
         try {
-            await Promise.all(Array.from({ length: Math.min(4, targets.length) }, () => worker()));
+            await Promise.all(Array.from({ length: Math.min(concurrency, targets.length) }, () => worker()));
         } finally {
             setBatchKind(null);
         }
@@ -270,7 +312,8 @@ export function SavedIpList() {
             const updated = await persistLatencyUpdates();
             showToast(updated > 0 ? `测延迟完成：共 ${targets.length} 个，已更新 ${updated} 条延迟` : `测延迟完成：共 ${targets.length} 个，没有可更新的延迟`, updated > 0 ? 'success' : 'warning');
         } else {
-            showToast(`测速完成：共 ${targets.length} 个`, 'success');
+            const updated = await persistSpeedUpdates();
+            showToast(updated > 0 ? `测速完成：共 ${targets.length} 个，已更新 ${updated} 条速度` : `测速完成：共 ${targets.length} 个，没有可更新的速度`, updated > 0 ? 'success' : 'warning');
         }
     };
 
@@ -327,16 +370,24 @@ export function SavedIpList() {
     // 选中的地区已被删空时自动回到全部
     const effectiveRegion = regionOptions.some(r => r.colo === selectedRegion) ? selectedRegion : 'all';
     const latencyMaxNum = /^\d+$/.test(latencyMax.trim()) ? parseInt(latencyMax.trim(), 10) : null;
+    const speedMinNum = /^\d+(\.\d+)?$/.test(speedMin.trim()) ? parseFloat(speedMin.trim()) : null;
     const filteredBySceneRegion = items.filter(i =>
         selectedScenes.has(i.sceneName) &&
         (effectiveRegion === 'all' || i.colo === effectiveRegion)
     );
     /** 延迟上限：只留延迟 ≤ 上限的；延迟 -1（无数据）的不算达标，也隐藏 */
-    const filteredItems = latencyMaxNum === null
+    const filteredByLatency = latencyMaxNum === null
         ? filteredBySceneRegion
         : filteredBySceneRegion.filter(i => i.latency >= 0 && i.latency <= latencyMaxNum);
-    const latencyHiddenCount = filteredBySceneRegion.length - filteredItems.length;
-    /** 表头排序：没数据的（丢包/抖动留空）永远排最后，不参与方向翻转 */
+    const latencyHiddenCount = filteredBySceneRegion.length - filteredByLatency.length;
+    /** 下载速度下限：只留速度 ≥ 下限的；没测过速度的不算达标，也隐藏 */
+    const filteredItems = speedMinNum === null
+        ? filteredByLatency
+        : filteredByLatency.filter(i => i.speedMbps !== undefined && i.speedMbps >= speedMinNum);
+    const speedHiddenCount = filteredByLatency.length - filteredItems.length;
+    /** 丢包显示取一位小数：33.33333333333333% → 33.3%，整数保持原样 */
+    const lossText = (v?: number) => v === undefined ? '' : (Number.isInteger(v) ? String(v) : v.toFixed(1));
+    /** 表头排序：没数据的（丢包/抖动/速度留空）永远排最后，不参与方向翻转 */
     const cmpOptNum = (a?: number, b?: number) => {
         if (a === undefined && b === undefined) return 0;
         if (a === undefined) return 1;
@@ -351,6 +402,7 @@ export function SavedIpList() {
             case 'latency': return dir * (a.latency - b.latency);
             case 'lossPct': return dir * cmpOptNum(a.lossPct, b.lossPct);
             case 'jitterMs': return dir * cmpOptNum(a.jitterMs, b.jitterMs);
+            case 'speedMbps': return dir * cmpOptNum(a.speedMbps, b.speedMbps);
             case 'colo': return dir * (a.colo || '').localeCompare(b.colo || '');
             case 'scene': return dir * a.sceneName.localeCompare(b.sceneName);
             default: return 0;
@@ -372,6 +424,15 @@ export function SavedIpList() {
         if (checked) newSet.add(id);
         else newSet.delete(id);
         setSelectedItems(newSet);
+    };
+
+    /** 场景全选/反选：选中的取消，没选的选上 */
+    const handleToggleAllScenes = () => {
+        setSelectedScenes(prev => {
+            const next = new Set<string>();
+            for (const s of uniqueScenes) if (!prev.has(s)) next.add(s);
+            return next;
+        });
     };
 
     const handleSelectAll = (checked: boolean) => {
@@ -450,7 +511,7 @@ export function SavedIpList() {
             return;
         }
 
-        const headers = ['IP地址', '端口', '3次延迟(ms)', '最好延迟(ms)', '丢包(%)', '抖动(ms)', '来源', '地区代码', '地区名称', '场景'];
+        const headers = ['IP地址', '端口', '3次延迟(ms)', '最好延迟(ms)', '丢包(%)', '抖动(ms)', '下载速度(MB/s)', '来源', '地区代码', '地区名称', '场景'];
         const csvContent = [
             headers.join(','),
             ...filteredItemsSorted.map(item => [
@@ -458,8 +519,9 @@ export function SavedIpList() {
                 item.port,
                 item.latencies && item.latencies.length > 0 ? item.latencies.join('/') : '',
                 item.latency,
-                item.lossPct !== undefined ? item.lossPct : '',
+                item.lossPct !== undefined ? lossText(item.lossPct) : '',
                 item.jitterMs !== undefined ? item.jitterMs : '',
+                item.speedMbps !== undefined ? item.speedMbps.toFixed(1) : '',
                 item.source ? SOURCE_LABELS[item.source] : '',
                 item.colo || '',
                 getColoName(item.colo || ''),
@@ -499,8 +561,9 @@ export function SavedIpList() {
                 const latency = `${item.latency}ms`;
                 const extra = [
                     item.source ? SOURCE_LABELS[item.source] : '',
-                    item.lossPct !== undefined ? `丢包${item.lossPct}%` : '',
+                    item.lossPct !== undefined ? `丢包${lossText(item.lossPct)}%` : '',
                     item.jitterMs !== undefined ? `抖动${item.jitterMs}ms` : '',
+                    item.speedMbps !== undefined ? `速度${item.speedMbps.toFixed(1)}MB/s` : '',
                 ].filter(Boolean).join('|');
                 const comment = [regionName, sceneName, latency, extra].filter(Boolean).join('|');
                 txtContent += `${item.ip}:${item.port}#${comment}\n`;
@@ -535,8 +598,9 @@ export function SavedIpList() {
             const latency = `${item.latency}ms`;
             const extra = [
                 item.source ? SOURCE_LABELS[item.source] : '',
-                item.lossPct !== undefined ? `丢包${item.lossPct}%` : '',
+                item.lossPct !== undefined ? `丢包${lossText(item.lossPct)}%` : '',
                 item.jitterMs !== undefined ? `抖动${item.jitterMs}ms` : '',
+                item.speedMbps !== undefined ? `速度${item.speedMbps.toFixed(1)}MB/s` : '',
             ].filter(Boolean).join('|');
             const comment = [regionName, sceneName, latency, extra].filter(Boolean).join('|');
             txtContent += `${item.ip}:${item.port}#${comment}\n`;
@@ -655,14 +719,34 @@ export function SavedIpList() {
                                 <span className="text-gray-400 dark:text-gray-500 font-normal">已隐藏 {latencyHiddenCount} 个</span>
                             )}
                         </span>
-                        {/* 操作按使用顺序排：先选场景，再勾行测，最后删、刷新 */}
-                        <div className="flex flex-wrap items-center gap-2 ml-auto">
+                        <span className="flex items-center gap-1 text-xs font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap ml-2" title="只显示下载速度不低于该值的 IP，没测过速度的不显示；留空为全部显示">
+                            速度 ≥
+                            <input
+                                type="text"
+                                inputMode="decimal"
+                                value={speedMin}
+                                placeholder="不限"
+                                onChange={(e) => {
+                                    const v = e.target.value.replace(/[^\d.]/g, '').replace(/(\..*)\./g, '$1').slice(0, 6);
+                                    setSpeedMin(v);
+                                    try { localStorage.setItem('CF_SAVED_SPEED_MIN', v); } catch { /* 忽略 */ }
+                                }}
+                                className="w-16 px-2 py-1 text-xs font-medium text-gray-700 bg-white border border-gray-200 rounded-full text-center dark:bg-gray-800 dark:text-gray-200 dark:border-gray-600 outline-none focus:border-indigo-400"
+                            />
+                            MB/s
+                            {speedMinNum !== null && speedHiddenCount > 0 && (
+                                <span className="text-gray-400 dark:text-gray-500 font-normal">已隐藏 {speedHiddenCount} 个</span>
+                            )}
+                        </span>
+                        {/* 左边：选场景 / 删选中；右边：批量测试 / 刷新 */}
+                        <div className="flex flex-wrap items-center gap-2">
                             <button
                                 type="button"
-                                onClick={() => setSelectedScenes(new Set(uniqueScenes))}
+                                onClick={handleToggleAllScenes}
+                                title="反选场景：选中的取消，没选的选上"
                                 className="px-3 py-1 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors"
                             >
-                                全选
+                                全选/反选
                             </button>
                             <button
                                 type="button"
@@ -671,9 +755,19 @@ export function SavedIpList() {
                             >
                                 清空
                             </button>
-                            <span className="w-px h-5 bg-gray-300 dark:bg-gray-600 mx-1" aria-hidden />
+                            {selectedItems.size > 0 && (
+                                <button
+                                    onClick={handleDeleteSelected}
+                                    className="px-3 py-1 text-xs font-medium text-red-800 bg-red-100 rounded-full hover:bg-red-200 dark:bg-red-900 dark:text-red-300 dark:hover:bg-red-800 transition-colors"
+                                >
+                                    <Trash2 className="w-3.5 h-3.5 mr-1 inline-block" />
+                                    删除选中 ({selectedItems.size})
+                                </button>
+                            )}
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2 ml-auto">
                             <span className="text-xs text-gray-500 dark:text-gray-400">已勾选 {selectedItems.size} 个</span>
-                            {/* 批量测试：只测已勾选的行，最多 4 个并发 */}
+                            {/* 批量测试：只测已勾选的行，探针/测延迟最多 4 个并发，测速 2 个并发 */}
                             <button
                                 type="button"
                                 onClick={() => handleBatchClick('probe')}
@@ -698,15 +792,6 @@ export function SavedIpList() {
                             >
                                 {batchKind === 'speed' ? `下载测速中 ${batchDone}/${batchTotal}…` : '一键测下载速度'}
                             </button>
-                            {selectedItems.size > 0 && (
-                                <button
-                                    onClick={handleDeleteSelected}
-                                    className="px-3 py-1 text-xs font-medium text-red-800 bg-red-100 rounded-full hover:bg-red-200 dark:bg-red-900 dark:text-red-300 dark:hover:bg-red-800 transition-colors"
-                                >
-                                    <Trash2 className="w-3.5 h-3.5 mr-1 inline-block" />
-                                    删除选中 ({selectedItems.size})
-                                </button>
-                            )}
                             <button
                                 onClick={loadData}
                                 className="px-3 py-1 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors"
@@ -746,6 +831,9 @@ export function SavedIpList() {
                                 <button type="button" onClick={() => toggleSort('jitterMs')} className="hover:text-gray-800 dark:hover:text-white" title="按抖动排序">抖动{sortArrow('jitterMs')}</button>
                             </th>
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+                                <button type="button" onClick={() => toggleSort('speedMbps')} className="hover:text-gray-800 dark:hover:text-white" title="按下载速度排序">下载速度{sortArrow('speedMbps')}</button>
+                            </th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
                                 <button type="button" onClick={() => toggleSort('colo')} className="hover:text-gray-800 dark:hover:text-white" title="按地区代码排序">地区代码{sortArrow('colo')}</button>
                             </th>
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
@@ -769,9 +857,9 @@ export function SavedIpList() {
                     </thead>
                     <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
                         {loading ? (
-                            <tr><td colSpan={11} className="px-4 py-4 text-center text-gray-500">加载中...</td></tr>
+                            <tr><td colSpan={12} className="px-4 py-4 text-center text-gray-500">加载中...</td></tr>
                         ) : filteredItems.length === 0 ? (
-                            <tr><td colSpan={11} className="px-4 py-4 text-center text-gray-500">暂无数据</td></tr>
+                            <tr><td colSpan={12} className="px-4 py-4 text-center text-gray-500">暂无数据</td></tr>
                         ) : (
                             filteredItemsSorted.map((item) => (
                                 <tr key={`${item.ip}-${item.port}-${item.sceneName}`} className="hover:bg-gray-50 dark:hover:bg-gray-700">
@@ -792,8 +880,16 @@ export function SavedIpList() {
                                     <td className={`px-4 py-2 whitespace-nowrap text-sm font-semibold ${getLatencyColor(item.latency)}`}>
                                         {item.latency > -1 ? `${item.latency}ms` : 'N/A'}
                                     </td>
-                                    <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{item.lossPct !== undefined ? `${item.lossPct}%` : '-'}</td>
+                                    <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{item.lossPct !== undefined ? `${lossText(item.lossPct)}%` : '-'}</td>
                                     <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{item.jitterMs !== undefined ? `${item.jitterMs}ms` : '-'}</td>
+                                    <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                                        {(() => {
+                                            const t = rowTests[itemKey(item)];
+                                            if (t?.testing === 'speed') return <span className="text-blue-600">测速中…</span>;
+                                            if (item.speedMbps !== undefined) return <span className="font-semibold text-blue-600">{item.speedMbps.toFixed(1)} MB/s</span>;
+                                            return '-';
+                                        })()}
+                                    </td>
                                     <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{item.colo || '-'}</td>
                                     <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{item.colo ? <RegionDisplay colo={item.colo} flagSize="sm" /> : '-'}</td>
                                     <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{item.sceneName}</td>
@@ -804,26 +900,22 @@ export function SavedIpList() {
                                                 <div className="flex flex-col gap-1">
                                                     {t?.testing === 'probe' && <span className="text-teal-600">探针中…</span>}
                                                     {t?.testing === 'latency' && <span className="text-emerald-600">测延迟中…</span>}
-                                                    {t?.testing === 'speed' && <span className="text-blue-600">下载测速中…</span>}
                                                     {t?.probe && (
                                                         <span className={t.probe.ok ? 'text-green-600' : 'text-red-600'}>
                                                             {t.probe.ok
                                                                 ? `通${t.probe.colo ? ` ${t.probe.colo}` : ''}${t.probe.latencyMs !== undefined ? ` ${t.probe.latencyMs}ms` : ''}`
-                                                                : '不通'}
+                                                                : `不通${t.probe.error ? `（${t.probe.error}）` : ''}`}
                                                         </span>
                                                     )}
-                                                    {t?.latency && (
-                                                        <span className={t.latency.ok ? 'text-emerald-600' : 'text-red-600'}>
-                                                            {t.latency.ok && t.latency.latency !== undefined
-                                                                ? `延迟 ${t.latency.latency}ms`
-                                                                : `测延迟失败${t.latency.error ? `（${t.latency.error}）` : ''}`}
+                                                    {/* 延迟/速度的成功结果各回自己的列，这里只留失败原因 */}
+                                                    {t?.latency && !t.latency.ok && (
+                                                        <span className="text-red-600 whitespace-normal break-all" title={t.latency.error || ''}>
+                                                            {`测延迟失败${t.latency.error ? `（${t.latency.error}）` : ''}`}
                                                         </span>
                                                     )}
-                                                    {t?.speed && (
-                                                        <span className={t.speed.ok ? 'text-blue-600' : 'text-red-600'}>
-                                                            {t.speed.ok && t.speed.speedMbps !== undefined
-                                                                ? `${t.speed.speedMbps.toFixed(1)} MB/s`
-                                                                : `测速失败${t.speed.error ? `（${t.speed.error}）` : ''}`}
+                                                    {t?.speed && !t.speed.ok && (
+                                                        <span className="text-red-600 whitespace-normal break-all" title={t.speed.error || ''}>
+                                                            {`测速失败${t.speed.error ? `（${t.speed.error}）` : ''}`}
                                                         </span>
                                                     )}
                                                 </div>

@@ -14,7 +14,6 @@ import {
     generateIps,
     planIpGeneration,
     formatIpCount,
-    MAX_SCAN_TARGETS,
     ScanResult,
     CF_CIDR_LIST,
     isDomainName,
@@ -447,10 +446,6 @@ export function ScannerConfig({ cfIps, selectedCidrs, onScanComplete }: IpScanne
                 showToast('当前来源里没有选中的段，请先在上方 IP 段库里选一段，或点「全选」恢复', 'error');
                 return null;
             }
-        }
-        const plan = planIpGeneration(cidrsToUse, countNum);
-        if (plan.mode === 'random' && countNum >= plan.total) {
-            showToast(`所选段共 ${formatIpCount(plan.total)} 个 IP，超过单次上限 ${MAX_SCAN_TARGETS.toLocaleString('en-US')}，已随机抽 ${plan.planned.toLocaleString('en-US')} 个`, 'warning');
         }
         const targets = generateIps(cidrsToUse, countNum);
         const sourceLabel = ipSource === 'cf' ? 'CF官方IP段' : 'CM整理IP段';

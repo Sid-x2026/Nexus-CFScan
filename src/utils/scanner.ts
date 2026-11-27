@@ -250,9 +250,6 @@ export function generateRandomIps(cidrs: string[], count: number): string[] {
     return Array.from(randomIps);
 }
 
-/** 单次扫描最多生成的目标数：段太大时全扫不现实，改随机抽这么多个 */
-export const MAX_SCAN_TARGETS = 20000;
-
 /** 单个 CIDR 包含的 IP 总数：2^(32-prefix) */
 export function cidrSize(cidr: string): number {
     const parts = cidr.split('/');
@@ -296,31 +293,30 @@ function enumerateIpsFromCIDR(cidr: string): string[] {
 }
 
 /**
- * 按 SHU 的规则生成本次扫描目标：
+ * 按 SHU 的规则生成本次扫描目标（2026-11-27 定：20000 上限取消，数量由用户自己控制）：
  * 随机数 ≥ 选中段的 IP 总数 → 全扫（按顺序枚举，不重不漏）；
  * 随机数 < 总数 → 随机抽指定个数。
- * 段太大（总数超过单次上限）时全扫不现实，改为随机抽上限个数。
  */
 export function generateIps(cidrs: string[], count: number): string[] {
     if (!cidrs || cidrs.length === 0) {
         return [];
     }
     const total = totalIps(cidrs);
-    if (count >= total && total <= MAX_SCAN_TARGETS) {
+    if (count >= total) {
         const all: string[] = [];
         for (const cidr of cidrs) all.push(...enumerateIpsFromCIDR(cidr));
         return all;
     }
-    return generateRandomIps(cidrs, Math.min(count, MAX_SCAN_TARGETS));
+    return generateRandomIps(cidrs, count);
 }
 
 /** 生成计划：供界面提前显示「本次全扫 / 随机抽几个」 */
 export function planIpGeneration(cidrs: string[], count: number): { mode: 'all' | 'random'; total: number; planned: number } {
     const total = totalIps(cidrs);
-    if (count >= total && total <= MAX_SCAN_TARGETS) {
+    if (count >= total) {
         return { mode: 'all', total, planned: total };
     }
-    return { mode: 'random', total, planned: Math.min(count, MAX_SCAN_TARGETS) };
+    return { mode: 'random', total, planned: count };
 }
 
 // =================================================================
