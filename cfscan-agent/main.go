@@ -627,8 +627,10 @@ type latencyResp struct {
 	OK        bool    `json:"ok"`
 	Latency   int     `json:"latency,omitempty"`
 	Latencies []int   `json:"latencies,omitempty"`
-	LossPct   float64 `json:"lossPct,omitempty"`
-	JitterMs  int     `json:"jitterMs,omitempty"`
+	// 丢包/抖动去掉 omitempty：0% / 0ms 是有效值，必须发出来；
+	// 否则前端收不到字段，会用空值把原来存的丢包/抖动盖掉、显示成 -。
+	LossPct   float64 `json:"lossPct"`
+	JitterMs  int     `json:"jitterMs"`
 	Error     string  `json:"error,omitempty"`
 }
 
