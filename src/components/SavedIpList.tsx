@@ -85,7 +85,7 @@ export function SavedIpList() {
     }
     const [rowTests, setRowTests] = useState<Record<string, RowTest>>({});
     /** 正在跑的批量测试：种类 + 进度（已完成 / 总数） */
-    const [batchKind, setBatchKind] = useState<'probe' | 'speed' | 'latency' | null>(null);
+    const [batchKind, setBatchKind] = useState<'probe' | 'speed' | 'latency' | 'probeLatency' | null>(null);
     const [batchDone, setBatchDone] = useState(0);
     const [batchTotal, setBatchTotal] = useState(0);
     /** 测延迟当前是第几遍 / 共几遍（3 遍拉开时间测，抖动才准）；探针/测速不用 */
@@ -254,9 +254,12 @@ export function SavedIpList() {
                 setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: undefined, speed: res } }));
                 if (res.ok && res.speedMbps !== undefined) {
                     speedUpdates.current[key] = { speedMbps: res.speedMbps };
+                    // 测完一个显示一个：不用等整批跑完，速度列立刻刷新
+                    setItems((prev) => prev.map((it) => itemKey(it) === key ? { ...it, speedMbps: res.speedMbps } : it));
                 } else {
                     // 测速失败按速度 0 算，写回后排序按最慢，不影响排序；429 不重试，直接显示测速限流
                     speedUpdates.current[key] = { speedMbps: 0 };
+                    setItems((prev) => prev.map((it) => itemKey(it) === key ? { ...it, speedMbps: 0 } : it));
                 }
             }
             return true;
@@ -290,31 +293,57 @@ export function SavedIpList() {
      * 丢包和抖动要等 3 遍全测完才能算，结束时和延迟一起刷新、一起写回。
      * 丢包/抖动即使是 0 也明确写 0，不再用 undefined 盖掉旧值。
      */
-    const runLatencyBatch = async (targets: FlatIpItem[], base: string) => {
+    /**
+     * 一键探针测延迟（探针 + 延迟 + 抖动一次跑完）：第一轮先跑探针再跑延迟，
+     * 探针和延迟第一轮测完就直接显示；抖动和丢包等 3 遍都跑完再一起算、一起显示。
+     * 点按钮时只清探针、延迟、丢包、抖动这三项，速度不动。
+     */
+    const runProbeLatencyBatch = async (targets: FlatIpItem[], base: string) => {
         const { rounds, timeoutMs, scanMode } = readLatencyParams();
         const acc: Record<string, { latencies: number[]; failures: number; lastError?: string }> = {};
         for (const item of targets) acc[itemKey(item)] = { latencies: [], failures: 0 };
         latencyUpdates.current = {};
         speedUpdates.current = {};
-        setBatchKind('latency');
+        setBatchKind('probeLatency');
         setBatchDone(0);
         setBatchTotal(targets.length * rounds);
         setBatchPass(0);
         setBatchRounds(rounds);
         cancelRef.current = false;
         setCancelling(false);
-        // 原数据先清零：延迟、丢包、抖动清掉，新结果出来再填
+        // 点按钮只清这三项：探针、延迟、丢包、抖动清掉，新结果出来再填；速度不动
         const targetKeysLatency = new Set(targets.map((it) => itemKey(it)));
         setItems((prev) => prev.map((it) => targetKeysLatency.has(itemKey(it)) ? { ...it, latency: 0, latencies: [], lossPct: 0, jitterMs: 0 } : it));
         setRowTests((prev) => {
             const next = { ...prev };
-            for (const k of targetKeysLatency) if (next[k]) next[k] = { ...next[k], latency: undefined };
+            for (const k of targetKeysLatency) if (next[k]) next[k] = { ...next[k], probe: undefined, latency: undefined };
             return next;
         });
         const busy = { value: false };
         // 单遍里测其中一个 IP 一次（rounds=1），成功就把延迟列刷新为目前最低值
-        const runOneRound = async (item: FlatIpItem): Promise<boolean> => {
+        const runOneRound = async (item: FlatIpItem, pass: number): Promise<boolean> => {
             const key = itemKey(item);
+            // 第一轮先跑探针，探针结果立刻显示在探针列
+            if (pass === 0) {
+                setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: 'probe' } }));
+                try {
+                    const probeRes = await probeSingle(base, {
+                        host: item.ip,
+                        ip: item.resolvedIp || item.ip,
+                        port: item.port,
+                        probeHost: readProbeHost(),
+                        speedUrl: 'auto',
+                        timeoutMs,
+                    });
+                    setRowTests(prev => ({ ...prev, [key]: { ...prev[key], probe: probeRes } }));
+                } catch (e) {
+                    if (e instanceof Error && e.message === AGENT_BUSY_ERROR) {
+                        setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: undefined } }));
+                        return false;
+                    }
+                    setRowTests(prev => ({ ...prev, [key]: { ...prev[key], probe: { ok: false, error: e instanceof Error ? e.message : '未知错误' } } }));
+                }
+            }
             setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: 'latency' } }));
             try {
                 const res = await latencySingle(base, {
@@ -353,7 +382,7 @@ export function SavedIpList() {
                 const worker = async () => {
                     while (idx < targets.length && !busy.value && !cancelRef.current) {
                         const item = targets[idx++];
-                        const ok = await runOneRound(item);
+                        const ok = await runOneRound(item, pass);
                         if (!ok) {
                             busy.value = true;
                             break;
@@ -394,11 +423,11 @@ export function SavedIpList() {
             }
         }
         const updated = await persistLatencyUpdates();
-        showToast(latencyCancelled ? `已取消：共 ${targets.length} 个，已测完 ${updated} 条延迟已保存` : (updated > 0 ? `测延迟完成：共 ${targets.length} 个，已更新 ${updated} 条延迟` : `测延迟完成：共 ${targets.length} 个，没有可更新的延迟`), updated > 0 ? 'success' : 'warning');
+        showToast(latencyCancelled ? `已取消：共 ${targets.length} 个，已测完 ${updated} 条延迟已保存` : (updated > 0 ? `探针测延迟完成：共 ${targets.length} 个，已更新 ${updated} 条延迟` : `探针测延迟完成：共 ${targets.length} 个，没有可更新的延迟`), updated > 0 ? 'success' : 'warning');
     };
 
-    /** 一键批量测试（探针/测速）：只测已勾选且当前可见的行；探针最多 4 个并发，测速 2 个并发；测延迟走 runLatencyBatch */
-    const runBatch = async (kind: 'probe' | 'speed' | 'latency', targets: FlatIpItem[]) => {
+    /** 一键批量测试：只测已勾选且当前可见的行；探针+延迟合起来走 runProbeLatencyBatch，测速走下面通用流程（1 并发） */
+    const runBatch = async (kind: 'probe' | 'speed' | 'latency' | 'probeLatency', targets: FlatIpItem[]) => {
         if (batchKind) return;
         if (targets.length === 0) {
             showToast('请先勾选要测试的 IP', 'warning');
@@ -407,12 +436,13 @@ export function SavedIpList() {
         const base = await getAgentBase();
         if (!base) return;
         if (await checkBusy(base)) return;
-        if (!(await checkEndpoint(base, kind === 'probe' ? '/probe' : kind === 'latency' ? '/latency' : '/speed'))) return;
-        // 测延迟走 3 遍拉开时间的专用流程（runLatencyBatch），探针/测速走下面通用流程
-        if (kind === 'latency') {
-            await runLatencyBatch(targets, base);
+        if (kind === 'probeLatency' || kind === 'latency') {
+            if (!(await checkEndpoint(base, '/probe'))) return;
+            if (!(await checkEndpoint(base, '/latency'))) return;
+            await runProbeLatencyBatch(targets, base);
             return;
         }
+        if (!(await checkEndpoint(base, kind === 'probe' ? '/probe' : '/speed'))) return;
         latencyUpdates.current = {};
         speedUpdates.current = {};
         setBatchKind(kind);
@@ -565,8 +595,32 @@ export function SavedIpList() {
         }
     });
 
+    /** 手动清零：把已勾选行的全部测试数据清掉（延迟、丢包、抖动、速度、探针），写回保存，测之前点一下 */
+    const handleClearAll = async () => {
+        const targets = filteredItemsSorted.filter(item => selectedItems.has(itemKey(item)));
+        if (targets.length === 0) {
+            showToast('请先勾选要清零的 IP', 'warning');
+            return;
+        }
+        const keys = new Set(targets.map((it) => itemKey(it)));
+        setItems((prev) => prev.map((it) => keys.has(itemKey(it)) ? { ...it, latency: 0, latencies: [], lossPct: 0, jitterMs: 0, speedMbps: 0 } : it));
+        setRowTests((prev) => {
+            const next = { ...prev };
+            for (const k of keys) if (next[k]) next[k] = { ...next[k], probe: undefined, latency: undefined, speed: undefined };
+            return next;
+        });
+        for (const item of targets) {
+            const k = itemKey(item);
+            latencyUpdates.current[k] = { latency: 0, latencies: [], lossPct: 0, jitterMs: 0 };
+            speedUpdates.current[k] = { speedMbps: 0 };
+        }
+        await persistLatencyUpdates();
+        await persistSpeedUpdates();
+        showToast(`已清零：共 ${targets.length} 个`, 'success');
+    };
+
     /** 批量测试的入口：从当前可见行里取已勾选的 */
-    const handleBatchClick = (kind: 'probe' | 'speed' | 'latency') => {
+    const handleBatchClick = (kind: 'speed' | 'probeLatency') => {
         const targets = filteredItemsSorted.filter(item => selectedItems.has(itemKey(item)));
         if (targets.length === 0) {
             showToast('请先勾选要测试的 IP', 'warning');
@@ -976,22 +1030,23 @@ export function SavedIpList() {
                                 <span className="text-xs text-gray-500 dark:text-gray-400">已勾选 {selectedItems.size} 个</span>
                             </div>
                             <div className="flex flex-wrap items-center gap-2">
-                            {/* 批量测试：只测已勾选的行，探针/测延迟最多 4 个并发，测速 2 个并发 */}
+                            {/* 批量测试：只测已勾选的行；探针+延迟+抖动一个按钮一次跑完，测速单独一个按钮；清零是手动的，点哪个测试按钮只清它对应的数据 */}
                             <button
                                 type="button"
-                                onClick={() => handleBatchClick('probe')}
+                                onClick={() => void handleClearAll()}
                                 disabled={batchKind !== null}
-                                className="px-3 py-1 text-xs font-medium text-teal-800 bg-teal-100 rounded-full hover:bg-teal-200 dark:bg-teal-900 dark:text-teal-300 dark:hover:bg-teal-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                title="把已勾选行的全部测试数据清零（延迟、丢包、抖动、速度、探针），测之前点一下"
+                                className="px-3 py-1 text-xs font-medium text-gray-800 bg-gray-100 rounded-full hover:bg-gray-200 dark:bg-gray-600 dark:text-gray-300 dark:hover:bg-gray-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                             >
-                                {batchKind === 'probe' ? `探针复检中 ${batchDone}/${batchTotal}…` : '一键探针复检'}
+                                清零
                             </button>
                             <button
                                 type="button"
-                                onClick={() => handleBatchClick('latency')}
+                                onClick={() => handleBatchClick('probeLatency')}
                                 disabled={batchKind !== null}
                                 className="px-3 py-1 text-xs font-medium text-emerald-800 bg-emerald-100 rounded-full hover:bg-emerald-200 dark:bg-emerald-900 dark:text-emerald-300 dark:hover:bg-emerald-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                             >
-                                {batchKind === 'latency' ? `测延迟中${batchRounds > 0 ? ` 第 ${batchPass}/${batchRounds} 轮` : ''} ${batchDone}/${batchTotal}…` : '一键测延迟'}
+                                {batchKind === 'probeLatency' ? `探针测延迟中${batchRounds > 0 ? ` 第 ${batchPass}/${batchRounds} 轮` : ''} ${batchDone}/${batchTotal}…` : '一键探针测延迟'}
                             </button>
                             <button
                                 type="button"
@@ -1055,7 +1110,7 @@ export function SavedIpList() {
                 <div className="mb-4">
                     <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
                         <span>
-                            {batchKind === 'probe' ? '探针复检中' : batchKind === 'latency' ? `测延迟中${batchRounds > 0 ? ` · 第 ${batchPass} / ${batchRounds} 轮` : ''}` : '下载测速中'}
+                            {batchKind === 'probe' ? '探针复检中' : batchKind === 'probeLatency' ? `探针测延迟中${batchRounds > 0 ? ` · 第 ${batchPass} / ${batchRounds} 轮` : ''}` : batchKind === 'latency' ? `测延迟中${batchRounds > 0 ? ` · 第 ${batchPass} / ${batchRounds} 轮` : ''}` : '下载测速中'}
                         </span>
                         <span className="flex items-center gap-2">
                             <span>{batchDone} / {batchTotal}（{Math.round((batchDone / batchTotal) * 100)}%）</span>
@@ -1071,7 +1126,7 @@ export function SavedIpList() {
                     </div>
                     <div className="w-full h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
                         <div
-                            className={`h-full rounded-full transition-all ${batchKind === 'probe' ? 'bg-teal-500' : batchKind === 'latency' ? 'bg-emerald-500' : 'bg-blue-500'}`}
+                            className={`h-full rounded-full transition-all ${batchKind === 'probe' ? 'bg-teal-500' : batchKind === 'latency' || batchKind === 'probeLatency' ? 'bg-emerald-500' : 'bg-blue-500'}`}
                             style={{ width: `${Math.min(100, Math.round((batchDone / batchTotal) * 100))}%` }}
                         />
                     </div>
@@ -1128,7 +1183,7 @@ export function SavedIpList() {
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
                                 <button type="button" onClick={() => toggleSort('scene')} className="hover:text-gray-800 dark:hover:text-white" title="按场景排序">场景{sortArrow('scene')}</button>
                             </th>
-                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">复检结果</th>
+                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">探针</th>
                         </tr>
                     </thead>
                     <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
@@ -1176,25 +1231,13 @@ export function SavedIpList() {
                                     <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
                                         {(() => {
                                             const t = rowTests[itemKey(item)];
-                                            return (
-                                                <div className="flex flex-col gap-1">
-                                                    {t?.testing === 'probe' && <span className="text-teal-600">探针中…</span>}
-                                                    {t?.testing === 'latency' && <span className="text-emerald-600">测延迟中…</span>}
-                                                    {t?.probe && (
-                                                        <span className={t.probe.ok ? 'text-green-600' : 'text-red-600'}>
-                                                            {t.probe.ok
-                                                                ? `通${t.probe.colo ? ` ${t.probe.colo}` : ''}${t.probe.latencyMs !== undefined ? ` ${t.probe.latencyMs}ms` : ''}`
-                                                                : `不通${t.probe.error ? `（${t.probe.error}）` : ''}`}
-                                                        </span>
-                                                    )}
-                                                    {/* 延迟/速度的成功结果各回自己的列，这里只留失败原因 */}
-                                                    {t?.latency && !t.latency.ok && (
-                                                        <span className="text-red-600 whitespace-normal break-all" title={t.latency.error || ''}>
-                                                            {`测延迟失败${t.latency.error ? `（${t.latency.error}）` : ''}`}
-                                                        </span>
-                                                    )}
-                                                </div>
-                                            );
+                                            if (t?.testing === 'probe') return <span className="text-teal-600">探针中…</span>;
+                                            if (t?.probe) {
+                                                return t.probe.ok
+                                                    ? <span className="font-semibold text-green-600">通过</span>
+                                                    : <span className="font-semibold text-red-600" title={t.probe.error || ''}>失败</span>;
+                                            }
+                                            return <span className="text-gray-400">-</span>;
                                         })()}
                                     </td>
                                 </tr>
