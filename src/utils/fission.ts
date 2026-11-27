@@ -60,10 +60,34 @@ export function encodeSubscription(lines: string[]): string {
 
 const FISSION_RE = /^([a-zA-Z0-9+.-]+:\/\/[^@]+@)([^:/?#]+)(:\d+.*)$/;
 
+/** 取一条链接的 ALPN（取第一个，大写），如 h3 → H3；没有就返回 ''（不显示） */
+function linkAlpn(link: string): string {
+    try {
+        const u = new URL(link);
+        const raw = u.searchParams.get('alpn') || '';
+        const first = raw.split(',')[0].trim();
+        return first ? first.toUpperCase() : '';
+    } catch {
+        return '';
+    }
+}
+
+/** 取一条链接的协议，如 VLESS XHTTP；没有传输类型就只取 scheme，都没有就返回 '' */
+function linkProtocol(link: string): string {
+    try {
+        const u = new URL(link);
+        const scheme = (u.protocol || '').replace(':', '').toUpperCase();
+        const type = (u.searchParams.get('type') || '').toUpperCase();
+        return [scheme, type].filter(Boolean).join(' ');
+    } catch {
+        return '';
+    }
+}
+
 /** 一条链接裂变：只换 host；addr 可带端口（1.2.3.4:2053），带了就连端口一起换，
- *  不带沿用原生链接的端口。namePrefix 有值时加到备注最前面（裂变|日本|原备注），
- *  除此之外备注原样保留，不再追加机房、延迟等后缀。 */
-export function fissionLink(link: string, addr: string, namePrefix?: string): string | null {
+ *  不带沿用原生链接的端口。节点名按新规则重写：ALPN|前缀|协议|地区，
+ *  如 H3|裂变|VLESS XHTTP|日本；没有 alpn 就不显示第一段，地区没有机房信息写「未知」。 */
+export function fissionLink(link: string, addr: string, namePrefix?: string, region?: string): string | null {
     const m = FISSION_RE.exec(link);
     if (!m) return null;
     let host = addr;
@@ -76,19 +100,13 @@ export function fissionLink(link: string, addr: string, namePrefix?: string): st
     let rest = m[3]; // :原生端口 + 后面（查询串 / 备注）
     if (port) rest = ':' + port + rest.replace(/^:\d+/, '');
     let out = m[1] + host + rest;
-    if (namePrefix) {
-        const hashIdx = out.indexOf('#');
-        if (hashIdx >= 0) {
-            let frag = out.slice(hashIdx + 1);
-            try {
-                frag = decodeURIComponent(frag);
-            } catch {
-                // 备注不是合法百分号编码，原样保留
-            }
-            out = out.slice(0, hashIdx + 1) + namePrefix + '|' + frag;
-        } else {
-            out = out + '#' + namePrefix;
-        }
+    const parts = [linkAlpn(link), (namePrefix || '').trim(), linkProtocol(link), region || '未知'].filter(Boolean);
+    const newName = parts.join('|');
+    const hashIdx = out.indexOf('#');
+    if (hashIdx >= 0) {
+        out = out.slice(0, hashIdx + 1) + newName;
+    } else {
+        out = out + '#' + newName;
     }
     return out;
 }
@@ -96,6 +114,8 @@ export function fissionLink(link: string, addr: string, namePrefix?: string): st
 export interface FissionAddr {
     /** 裂变用的地址：域名源用解析出的实际 IP，其余用 IP 本身；可带端口 */
     addr: string;
+    /** 该地址的地区国家名（场景模式按机房，自定义输入写「未知」） */
+    region?: string;
 }
 
 /** 按备注第一段区分：直连节点原样跟上，不裂变；其余按隧道节点裂变。 */
@@ -150,7 +170,7 @@ export function fissionLinks(
     if (mode === 'all') {
         for (const link of argoLinks) {
             for (const a of addrs) {
-                const f = fissionLink(link, a.addr, namePrefix);
+                const f = fissionLink(link, a.addr, namePrefix, a.region);
                 if (f) fissioned.push(f);
             }
         }
@@ -162,7 +182,7 @@ export function fissionLinks(
                 fissioned.push(link);
                 return;
             }
-            const f = fissionLink(link, a.addr, namePrefix);
+            const f = fissionLink(link, a.addr, namePrefix, a.region);
             if (f) fissioned.push(f);
         });
     }

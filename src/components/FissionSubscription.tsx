@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { getScenes, getSceneResults, createSubLink } from '../api';
 import { ScanResult } from '../utils/scanner';
-import { getColoName } from '../utils/colo';
+import { getColoName, getColoCountryName } from '../utils/colo';
 import { useToast } from './Toast';
 import {
     decodeSubscription, encodeSubscription, fissionLinks, clashYaml, singboxLinks,
@@ -17,7 +17,6 @@ const NATIVE_SAVED_KEY = 'CF_FISSION_NATIVE_SAVED';
 const SCENE_KEY = 'CF_FISSION_SCENE';
 const CUSTOM_KEY = 'CF_FISSION_CUSTOM';
 const NAME_PREFIX_KEY = 'CF_FISSION_NAME_PREFIX';
-const NAME_REGION_KEY = 'CF_FISSION_NAME_REGION';
 const FISSION_LATENCY_MAX_KEY = 'CF_FISSION_LATENCY_MAX';
 const FISSION_SPEED_MIN_KEY = 'CF_FISSION_SPEED_MIN';
 /** 一次裂变最多生成的节点数，防止误选几十个 IP 把订阅撑爆 */
@@ -74,7 +73,6 @@ export function FissionSubscription() {
     const [mode, setMode] = useState<'one' | 'all'>('one');
     // 节点命名：前缀 + 地区，如 裂变|日本|原协议名称
     const [namePrefix, setNamePrefix] = useState(() => loadStored(NAME_PREFIX_KEY, '裂变'));
-    const [nameRegion, setNameRegion] = useState(() => loadStored(NAME_REGION_KEY, ''));
     const [result, setResult] = useState<FissionResult | null>(null);
     // 二维码弹窗
     const [qrTarget, setQrTarget] = useState<{ label: string; content: string } | null>(null);
@@ -169,15 +167,17 @@ export function FissionSubscription() {
     /** 自定义输入的解析结果（一行一个 IP 或域名，可带端口） */
     const customParsed = useMemo(() => parseCustomAddrs(customText), [customText]);
 
-    /** 本次裂变的优选地址：场景模式用勾选的 IP（按延迟从低到高，筛选后才算），自定义模式用输入的地址 */
+    /** 本次裂变的优选地址：场景模式用勾选的 IP（按延迟从低到高，筛选后才算），自定义模式用输入的地址；
+     *  地区按每个 IP 的机房写国家名（如 NRT → 日本），自定义输入没有机房信息写「未知」 */
     const selectedAddrs: FissionAddr[] = useMemo(() => {
-        if (source === 'custom') return customParsed.addrs;
+        if (source === 'custom') return customParsed.addrs.map((a) => ({ ...a, region: '未知' }));
         return filteredItems
             .filter((r) => checked.has(itemKey(r)))
             .map((r) => ({
                 // 域名源用解析出的实际 IP，其余用 IP 本身；端口直接用保存的端口，
                 // 裂变时连端口一起换，不用再手动改
                 addr: (r.resolvedIp || r.ip) + (r.port ? `:${r.port}` : ''),
+                region: getColoCountryName(r.colo),
             }));
     }, [source, customParsed, filteredItems, checked]);
 
@@ -230,8 +230,8 @@ export function FissionSubscription() {
             showToast(`裂变后会超过 ${MAX_FISSION_LINKS} 条节点，请减少优选地址或改用「每协议 1 个 IP」`, 'warning');
             return;
         }
-        // 命名：前缀|地区|原协议名称，如 裂变|日本|Argo丨Xray丨xhttp_h2；都留空则不改名
-        const prefix = [namePrefix.trim(), nameRegion.trim()].filter(Boolean).join('|') || undefined;
+        // 命名：ALPN|前缀|协议|地区，如 H3|裂变|VLESS XHTTP|日本；没有 alpn 就不显示第一段
+        const prefix = namePrefix.trim() || undefined;
         const r = fissionLinks(nativeLinks, selectedAddrs, mode, prefix);
         setResult(r);
         setSubLinks({});
@@ -626,7 +626,7 @@ export function FissionSubscription() {
                 </button>
             </div>
             <p className="text-xs text-gray-500 dark:text-gray-400 mb-6">
-                两种给法都行：上面填订阅链接点拉取，或下面直接粘贴节点。打开时这里是空的，不显示上次的节点；想复用就按名字存到浏览器本地，用的时候在上面选出来，只填裂变 IP 就能生成。节点名称只按命名规则来：前缀|地区|原协议名称，不再追加机房、延迟。场景模式用每个 IP 保存的端口，自定义输入里写了端口的也按写的来。
+                两种给法都行：上面填订阅链接点拉取，或下面直接粘贴节点。打开时这里是空的，不显示上次的节点；想复用就按名字存到浏览器本地，用的时候在上面选出来，只填裂变 IP 就能生成。节点名称只按命名规则来：ALPN|前缀|协议|地区，不再追加机房、延迟。场景模式用每个 IP 保存的端口，自定义输入里写了端口的也按写的来。
             </p>
 
             {/* ③ 分配方式 + 节点命名 */}
@@ -668,22 +668,9 @@ export function FissionSubscription() {
                         className="w-28 p-2 border rounded-md dark:bg-gray-600 dark:border-gray-500 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none"
                     />
                 </label>
-                <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
-                    地区
-                    <input
-                        type="text"
-                        value={nameRegion}
-                        onChange={(e) => {
-                            setNameRegion(e.target.value);
-                            saveStored(NAME_REGION_KEY, e.target.value);
-                        }}
-                        placeholder="日本"
-                        className="w-28 p-2 border rounded-md dark:bg-gray-600 dark:border-gray-500 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none"
-                    />
-                </label>
             </div>
             <p className="text-xs text-gray-500 dark:text-gray-400 mb-6">
-                示例：前缀填「裂变」、地区填「日本」→ 裂变|日本|Argo丨Xray丨xhttp_h2。两项都留空则不改名；裂变后每条节点的名称还能在下面单独改。
+                示例：前缀填「裂变」→ H3|裂变|VLESS XHTTP|日本。地区按每个优选 IP 的机房自动写国家名，没有机房信息写「未知」；没有 alpn 就不显示第一段；裂变后每条节点的名称还能在下面单独改。
             </p>
             <button
                 type="button"
