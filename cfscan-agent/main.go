@@ -721,7 +721,7 @@ func handleSpeed(w http.ResponseWriter, r *http.Request) {
 	}
 	speedURL := strings.TrimSpace(req.SpeedURL)
 	if speedURL == "" || speedURL == "auto" {
-		speedURL = "https://speed.cloudflare.com/__down?bytes=10000000"
+		speedURL = "https://speed.cloudflare.com/__down?bytes=5000000"
 	}
 	// Total budget: ~8 s max (or the caller's timeout if smaller).
 	total := 8 * time.Second
@@ -771,8 +771,8 @@ func handleSpeed(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, speedResp{OK: false, ElapsedMs: ms(time.Since(start)), Error: fmt.Sprintf("HTTP %d", resp.StatusCode)})
 		return
 	}
-	// Cap at 10 MB; the context deadline caps the time at ~8 s.
-	n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, 10*1024*1024))
+	// Cap at 5 MB; the context deadline caps the time at ~8 s.
+	n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, 5*1024*1024))
 	elapsed := time.Since(start)
 	elapsedMs := ms(elapsed)
 	if n <= 0 {

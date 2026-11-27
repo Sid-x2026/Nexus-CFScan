@@ -570,21 +570,6 @@ export function FissionSubscription() {
                         <option key={name} value={name}>{name}</option>
                     ))}
                 </select>
-                <input
-                    type="text"
-                    value={newSaveName}
-                    onChange={(e) => setNewSaveName(e.target.value)}
-                    placeholder="起个名字保存，比如 VPSA"
-                    className="w-44 p-2 border rounded-md text-sm dark:bg-gray-600 dark:border-gray-500 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none"
-                />
-                <button
-                    type="button"
-                    onClick={handleSaveNative}
-                    disabled={!native.trim() || !newSaveName.trim()}
-                    className="px-3 py-2 text-xs font-medium text-blue-800 bg-blue-100 rounded-full hover:bg-blue-200 dark:bg-blue-900 dark:text-blue-300 dark:hover:bg-blue-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                    保存当前原节点
-                </button>
                 {selectedSavedName && (
                     <button
                         type="button"
@@ -622,6 +607,24 @@ export function FissionSubscription() {
                 placeholder="或者直接粘贴节点完整信息：明文链接（一行一条）或 base64 订阅内容。6 条 Argo 隧道链接会被裂变，直连链接原样保留。"
                 className="w-full p-3 border rounded-md font-mono text-sm dark:bg-gray-600 dark:border-gray-500 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none mb-2"
             />
+            <div className="flex justify-end items-center gap-2 mb-2">
+                <input
+                    type="text"
+                    value={newSaveName}
+                    onChange={(e) => setNewSaveName(e.target.value)}
+                    placeholder="文件名，比如 VPSA"
+                    className="w-44 p-2 border rounded-md text-sm dark:bg-gray-600 dark:border-gray-500 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none"
+                />
+                <button
+                    type="button"
+                    onClick={handleSaveNative}
+                    disabled={!native.trim() || !newSaveName.trim()}
+                    title="名字空白保存不了"
+                    className="px-4 py-2 text-sm font-medium text-white bg-purple-600 rounded-md hover:bg-purple-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed"
+                >
+                    节点保存
+                </button>
+            </div>
             <p className="text-xs text-gray-500 dark:text-gray-400 mb-6">
                 两种给法都行：上面填订阅链接点拉取，或下面直接粘贴节点。打开时这里是空的，不显示上次的节点；想复用就按名字存到浏览器本地，用的时候在上面选出来，只填裂变 IP 就能生成。节点名称只按命名规则来：前缀|地区|原协议名称，不再追加机房、延迟。场景模式用每个 IP 保存的端口，自定义输入里写了端口的也按写的来。
             </p>

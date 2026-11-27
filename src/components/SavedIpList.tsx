@@ -43,9 +43,10 @@ export function SavedIpList() {
     const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
     /** 场景管理面板是否展开：列出每个场景的名字和个数，可直接删除场景 */
     const [showSceneManage, setShowSceneManage] = useState(false);
-    /** 另存为：把勾选的 IP 另存成一个新场景名 */
+    /** 另存为：把勾选的 IP 另存成一个新场景名，点了按钮弹出框输入名字 */
     const [saveAsName, setSaveAsName] = useState('');
     const [isSavingAs, setIsSavingAs] = useState(false);
+    const [showSaveAsModal, setShowSaveAsModal] = useState(false);
     /** 地区筛选：下拉选一个机房代码（NRT/HKG/ICN…），只看该地区的 IP；'all' 为全部 */
     const [selectedRegion, setSelectedRegion] = useState<string>('all');
     /** 表头排序：点一下按该列升序，再点一下降序；默认按延迟升序（和原来一致） */
@@ -90,6 +91,14 @@ export function SavedIpList() {
     /** 测延迟当前是第几遍 / 共几遍（3 遍拉开时间测，抖动才准）；探针/测速不用 */
     const [batchPass, setBatchPass] = useState(0);
     const [batchRounds, setBatchRounds] = useState(0);
+    /** 取消批量测试：点取消后不再测新的，正在测的测完就停，已测完的照常写回 */
+    const cancelRef = useRef(false);
+    const [cancelling, setCancelling] = useState(false);
+    const handleCancelBatch = () => {
+        if (batchKind === null) return;
+        cancelRef.current = true;
+        setCancelling(true);
+    };
     /** 本批测延迟攒下的新延迟：整批跑完一次性写回已保存数据，避免 4 并发各写各的互相覆盖 */
     const latencyUpdates = useRef<Record<string, { latency: number; latencies?: number[]; lossPct?: number; jitterMs?: number }>>({});
     /** 本批测下载速度攒下的新速度：整批跑完一次性写回已保存数据（和测延迟同一套路，失败的行不更新） */
@@ -241,15 +250,13 @@ export function SavedIpList() {
                     latencyUpdates.current[key] = { latency: res.latency, latencies: res.latencies, lossPct: res.lossPct, jitterMs: res.jitterMs };
                 }
             } else {
-                let res = await speedSingle(base, req);
-                // 429 是测速端限流：等 5 秒再试一次，还 429 就把原因留给表内显示
-                if (!res.ok && res.error && /429/.test(res.error)) {
-                    await sleep(5000);
-                    res = await speedSingle(base, req);
-                }
+                const res = await speedSingle(base, req);
                 setRowTests(prev => ({ ...prev, [key]: { ...prev[key], testing: undefined, speed: res } }));
                 if (res.ok && res.speedMbps !== undefined) {
                     speedUpdates.current[key] = { speedMbps: res.speedMbps };
+                } else {
+                    // 测速失败按速度 0 算，写回后排序按最慢，不影响排序；429 不重试，直接显示测速限流
+                    speedUpdates.current[key] = { speedMbps: 0 };
                 }
             }
             return true;
@@ -270,6 +277,7 @@ export function SavedIpList() {
                             : { speed: { ok: false, error: e instanceof Error ? e.message : '未知错误' } }),
                 },
             }));
+            if (kind === 'speed') speedUpdates.current[key] = { speedMbps: 0 };
             return true;
         }
     };
@@ -293,6 +301,16 @@ export function SavedIpList() {
         setBatchTotal(targets.length * rounds);
         setBatchPass(0);
         setBatchRounds(rounds);
+        cancelRef.current = false;
+        setCancelling(false);
+        // 原数据先清零：延迟、丢包、抖动清掉，新结果出来再填
+        const targetKeysLatency = new Set(targets.map((it) => itemKey(it)));
+        setItems((prev) => prev.map((it) => targetKeysLatency.has(itemKey(it)) ? { ...it, latency: 0, latencies: [], lossPct: 0, jitterMs: 0 } : it));
+        setRowTests((prev) => {
+            const next = { ...prev };
+            for (const k of targetKeysLatency) if (next[k]) next[k] = { ...next[k], latency: undefined };
+            return next;
+        });
         const busy = { value: false };
         // 单遍里测其中一个 IP 一次（rounds=1），成功就把延迟列刷新为目前最低值
         const runOneRound = async (item: FlatIpItem): Promise<boolean> => {
@@ -329,11 +347,11 @@ export function SavedIpList() {
             return true;
         };
         try {
-            for (let pass = 0; pass < rounds && !busy.value; pass++) {
+            for (let pass = 0; pass < rounds && !busy.value && !cancelRef.current; pass++) {
                 setBatchPass(pass + 1);
                 let idx = 0;
                 const worker = async () => {
-                    while (idx < targets.length && !busy.value) {
+                    while (idx < targets.length && !busy.value && !cancelRef.current) {
                         const item = targets[idx++];
                         const ok = await runOneRound(item);
                         if (!ok) {
@@ -349,11 +367,13 @@ export function SavedIpList() {
             setBatchKind(null);
             setBatchPass(0);
             setBatchRounds(0);
+            setCancelling(false);
         }
         if (busy.value) {
             showToast('请等扫描结束再测', 'warning');
             return;
         }
+        const latencyCancelled = cancelRef.current;
         for (const item of targets) {
             const key = itemKey(item);
             const a = acc[key];
@@ -374,7 +394,7 @@ export function SavedIpList() {
             }
         }
         const updated = await persistLatencyUpdates();
-        showToast(updated > 0 ? `测延迟完成：共 ${targets.length} 个，已更新 ${updated} 条延迟` : `测延迟完成：共 ${targets.length} 个，没有可更新的延迟`, updated > 0 ? 'success' : 'warning');
+        showToast(latencyCancelled ? `已取消：共 ${targets.length} 个，已测完 ${updated} 条延迟已保存` : (updated > 0 ? `测延迟完成：共 ${targets.length} 个，已更新 ${updated} 条延迟` : `测延迟完成：共 ${targets.length} 个，没有可更新的延迟`), updated > 0 ? 'success' : 'warning');
     };
 
     /** 一键批量测试（探针/测速）：只测已勾选且当前可见的行；探针最多 4 个并发，测速 2 个并发；测延迟走 runLatencyBatch */
@@ -398,14 +418,32 @@ export function SavedIpList() {
         setBatchKind(kind);
         setBatchDone(0);
         setBatchTotal(targets.length);
+        cancelRef.current = false;
+        setCancelling(false);
+        // 原数据先清零：探针先把复检结果清空，测速先把速度清成 0.0，新结果出来再填
+        const targetKeys = new Set(targets.map((it) => itemKey(it)));
+        if (kind === 'probe') {
+            setRowTests((prev) => {
+                const next = { ...prev };
+                for (const k of targetKeys) if (next[k]) next[k] = { ...next[k], probe: undefined };
+                return next;
+            });
+        } else {
+            setItems((prev) => prev.map((it) => targetKeys.has(itemKey(it)) ? { ...it, speedMbps: 0 } : it));
+            setRowTests((prev) => {
+                const next = { ...prev };
+                for (const k of targetKeys) if (next[k]) next[k] = { ...next[k], speed: undefined };
+                return next;
+            });
+        }
         const busy = { value: false };
         let idx = 0;
-        // 测速降到 2 并发、每次开测间隔 500ms：一次几十个下载同时打过去，测速端会回 429 限流
-        const concurrency = kind === 'speed' ? 2 : 4;
+        // 测速降到 1 并发、每次开测间隔 2000ms：一次几十个下载同时打过去，测速端会回 429 限流
+        const concurrency = kind === 'speed' ? 1 : 4;
         const worker = async () => {
-            while (idx < targets.length && !busy.value) {
+            while (idx < targets.length && !busy.value && !cancelRef.current) {
                 const item = targets[idx++];
-                if (kind === 'speed') await sleep(500);
+                if (kind === 'speed') await sleep(2000);
                 const ok = await runSingleTest(item, kind, base);
                 if (!ok) {
                     busy.value = true;
@@ -418,16 +456,18 @@ export function SavedIpList() {
             await Promise.all(Array.from({ length: Math.min(concurrency, targets.length) }, () => worker()));
         } finally {
             setBatchKind(null);
+            setCancelling(false);
         }
         if (busy.value) {
             showToast('请等扫描结束再测', 'warning');
             return;
         }
+        const batchCancelled = cancelRef.current;
         if (kind === 'probe') {
-            showToast(`探针复检完成：共 ${targets.length} 个`, 'success');
+            showToast(batchCancelled ? `已取消：探针复检共 ${targets.length} 个` : `探针复检完成：共 ${targets.length} 个`, batchCancelled ? 'warning' : 'success');
         } else {
             const updated = await persistSpeedUpdates();
-            showToast(updated > 0 ? `测速完成：共 ${targets.length} 个，已更新 ${updated} 条速度` : `测速完成：共 ${targets.length} 个，没有可更新的速度`, updated > 0 ? 'success' : 'warning');
+            showToast(batchCancelled ? `已取消：测速共 ${targets.length} 个，已测完 ${updated} 条速度已保存` : (updated > 0 ? `测速完成：共 ${targets.length} 个，已更新 ${updated} 条速度` : `测速完成：共 ${targets.length} 个，没有可更新的速度`), updated > 0 ? 'success' : 'warning');
         }
     };
 
@@ -652,6 +692,7 @@ export function SavedIpList() {
             await saveResults(name, dataToSave as ScanResult[], 'overwrite');
             showToast(`已另存为场景「${name}」，共 ${targets.length} 个IP/域名`, 'success');
             setSaveAsName('');
+            setShowSaveAsModal(false);
             await loadData();
             try { window.dispatchEvent(new CustomEvent('cf:scenes-changed')); } catch { /* 忽略 */ }
         } catch (e) {
@@ -848,10 +889,10 @@ export function SavedIpList() {
                         <select
                             value={effectiveRegion}
                             onChange={(e) => setSelectedRegion(e.target.value)}
-                            className="px-2.5 py-1 text-xs font-medium text-gray-700 bg-white border border-gray-200 rounded-full hover:border-gray-300 dark:bg-gray-800 dark:text-gray-200 dark:border-gray-600 outline-none cursor-pointer"
+                            className="w-28 truncate px-2.5 py-1 text-xs font-medium text-gray-700 bg-white border border-gray-200 rounded-full hover:border-gray-300 dark:bg-gray-800 dark:text-gray-200 dark:border-gray-600 outline-none cursor-pointer"
                             title="按地区筛选"
                         >
-                            <option value="all">全部地区</option>
+                            <option value="all">全部</option>
                             {regionOptions.map(({ colo, count }) => (
                                 <option key={colo} value={colo}>{colo} · {getColoName(colo)}（{count} 个）</option>
                             ))}
@@ -1016,7 +1057,17 @@ export function SavedIpList() {
                         <span>
                             {batchKind === 'probe' ? '探针复检中' : batchKind === 'latency' ? `测延迟中${batchRounds > 0 ? ` · 第 ${batchPass} / ${batchRounds} 轮` : ''}` : '下载测速中'}
                         </span>
-                        <span>{batchDone} / {batchTotal}（{Math.round((batchDone / batchTotal) * 100)}%）</span>
+                        <span className="flex items-center gap-2">
+                            <span>{batchDone} / {batchTotal}（{Math.round((batchDone / batchTotal) * 100)}%）</span>
+                            <button
+                                type="button"
+                                onClick={handleCancelBatch}
+                                disabled={cancelling}
+                                className="px-2 py-0.5 text-xs font-medium text-red-800 bg-red-100 rounded-full hover:bg-red-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                {cancelling ? '取消中…' : '取消'}
+                            </button>
+                        </span>
                     </div>
                     <div className="w-full h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
                         <div
@@ -1111,6 +1162,11 @@ export function SavedIpList() {
                                         {(() => {
                                             const t = rowTests[itemKey(item)];
                                             if (t?.testing === 'speed') return <span className="text-blue-600">测速中…</span>;
+                                            if (t?.speed && !t.speed.ok) {
+                                                const err = t.speed.error || '测速失败';
+                                                const is429 = /429/.test(err);
+                                                return <span className="font-semibold text-red-600 whitespace-normal break-all" title={err}>{is429 ? '测速限流' : err}</span>;
+                                            }
                                             return <span className="font-semibold text-blue-600">{(item.speedMbps ?? 0).toFixed(1)} MB/s</span>;
                                         })()}
                                     </td>
@@ -1137,11 +1193,6 @@ export function SavedIpList() {
                                                             {`测延迟失败${t.latency.error ? `（${t.latency.error}）` : ''}`}
                                                         </span>
                                                     )}
-                                                    {t?.speed && !t.speed.ok && (
-                                                        <span className="text-red-600 whitespace-normal break-all" title={t.speed.error || ''}>
-                                                            {`测速失败${t.speed.error ? `（${t.speed.error}）` : ''}`}
-                                                        </span>
-                                                    )}
                                                 </div>
                                             );
                                         })()}
@@ -1153,8 +1204,7 @@ export function SavedIpList() {
                 </table>
 
             </div>
-            <div className="mt-8 flex flex-col items-center gap-3">
-                <div className="flex justify-center gap-4">
+            <div className="mt-8 flex justify-center gap-4">
                     <button onClick={handleExportCsv} className="flex items-center px-4 py-2 font-bold text-white bg-green-600 rounded hover:bg-green-700 transition-colors">
                         <File className="w-4 h-4 mr-2" />
                         导出 CSV
@@ -1167,26 +1217,64 @@ export function SavedIpList() {
                         <Copy className="w-4 h-4 mr-2" />
                         复制
                     </button>
-                </div>
-                <div className="flex flex-wrap items-center justify-center gap-3">
-                    <span className="text-sm font-medium text-gray-700 dark:text-gray-200">另存为：</span>
-                    <input
-                        type="text"
-                        value={saveAsName}
-                        onChange={(e) => setSaveAsName(e.target.value)}
-                        placeholder="另外一个场景名，比如 CF-2"
-                        className="p-2 border rounded-md w-64 text-sm dark:bg-gray-600 dark:border-gray-500 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none"
-                    />
                     <button
-                        onClick={handleSaveAsSelected}
-                        disabled={isSavingAs || selectedItems.size === 0 || !saveAsName.trim()}
-                        className="flex items-center px-4 py-2 font-bold text-white bg-green-600 rounded hover:bg-green-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed"
+                        onClick={() => {
+                            if (selectedItems.size === 0) {
+                                showToast('请先勾选要另存的 IP，二次扫完好的勾上再存', 'warning');
+                                return;
+                            }
+                            setShowSaveAsModal(true);
+                        }}
+                        title="场景里二次扫完，勾上好的 IP，另存到一个新场景，原场景不动"
+                        className="flex items-center px-4 py-2 font-bold text-white bg-teal-600 rounded hover:bg-teal-700 transition-colors"
                     >
-                        {isSavingAs ? '另存中...' : `另存为新场景${selectedItems.size > 0 ? `（${selectedItems.size} 个）` : ''}`}
+                        <Copy className="w-4 h-4 mr-2" />
+                        另存为
                     </button>
-                    <span className="text-xs text-gray-500 dark:text-gray-400">场景里二次扫完，勾上好的 IP，另存到一个新场景，原场景不动，新场景进场景管理。</span>
-                </div>
             </div>
+            {/* 另存为弹窗：输入新场景名，确认后把勾选的 IP 另存过去 */}
+            {showSaveAsModal && (
+                <div
+                    className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+                    onClick={() => setShowSaveAsModal(false)}
+                >
+                    <div
+                        className="bg-white dark:bg-gray-800 rounded-lg shadow-xl p-6 w-full max-w-sm"
+                        onClick={(e) => e.stopPropagation()}
+                    >
+                        <h3 className="text-lg font-semibold text-gray-700 dark:text-gray-200 mb-4">另存为新场景</h3>
+                        <p className="text-sm text-gray-500 dark:text-gray-400 mb-3">已勾选 {selectedItems.size} 个 IP，存到一个新场景，原场景不动，新场景进场景管理。</p>
+                        <input
+                            type="text"
+                            autoFocus
+                            value={saveAsName}
+                            onChange={(e) => setSaveAsName(e.target.value)}
+                            onKeyDown={(e) => {
+                                if (e.key === 'Enter') void handleSaveAsSelected();
+                            }}
+                            placeholder="另外一个场景名，比如 CF-2"
+                            className="w-full p-2 border rounded-md text-sm dark:bg-gray-600 dark:border-gray-500 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none mb-4"
+                        />
+                        <div className="flex justify-end gap-3">
+                            <button
+                                type="button"
+                                onClick={() => setShowSaveAsModal(false)}
+                                className="px-4 py-2 text-sm font-medium text-gray-800 bg-gray-100 rounded-md hover:bg-gray-200 dark:bg-gray-600 dark:text-gray-300 dark:hover:bg-gray-500 transition-colors"
+                            >
+                                取消
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => void handleSaveAsSelected()}
+                                disabled={isSavingAs || !saveAsName.trim()}
+                                className="px-4 py-2 text-sm font-medium text-white bg-teal-600 rounded-md hover:bg-teal-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed"
+                            >
+                                {isSavingAs ? '另存中...' : '确定另存'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
                 </>
             )}
         </div>
